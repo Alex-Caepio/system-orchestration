@@ -521,6 +521,61 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
     assert_eq!(boot["runtime"]["working_memory"], true);
     assert!(boot.get("accelerators").is_none());
 
+    // Verify GET /api/app/update returns 200 unsupported state (zero 404 console errors).
+    let update_resp = client.get(format!("{base}/api/app/update?check=1")).send().await.unwrap();
+    assert_eq!(update_resp.status(), 200);
+    let update_json: Value = serde_json::from_str(&update_resp.text().await.unwrap()).unwrap();
+    assert_eq!(update_json["supported"], false);
+    assert_eq!(update_json["available"], false);
+    let update_bad = client.get(format!("{base}/api/app/update?check=no")).send().await.unwrap();
+    assert_eq!(update_bad.status(), 400);
+
+    // Verify optional catalog autoload returns 200 empty-state when system.json is absent,
+    // while explicit load without optional still returns 404.
+    let project_id = boot["projects"][0]["id"].as_str().unwrap();
+    let opt_catalog = client
+        .post(format!("{base}/api/systems/catalog"))
+        .header("x-harness-token", &token)
+        .header("content-type", "application/json")
+        .body(json!({"project_id": project_id, "config_path": "system.json", "optional": true}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opt_catalog.status(), 200);
+    let opt_json: Value = serde_json::from_str(&opt_catalog.text().await.unwrap()).unwrap();
+    assert_eq!(opt_json["missing"], true);
+    assert!(opt_json["catalog"].is_null());
+
+    let strict_catalog = client
+        .post(format!("{base}/api/systems/catalog"))
+        .header("x-harness-token", &token)
+        .header("content-type", "application/json")
+        .body(json!({"project_id": project_id, "config_path": "system.json"}).to_string())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(strict_catalog.status(), 404);
+
+    // Verify HTML fixes (DOM nesting inside <main>, theme IDs, collapsed #model-hint) and CSS select fixes.
+    let html = client.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
+    assert!(html.contains(r#"id="theme-dark""#));
+    assert!(html.contains(r#"id="model-hint" data-visible="false""#));
+    let main_start = html.find(r#"<main class="main" id="main""#).unwrap();
+    let main_end = html.rfind("</main>").unwrap();
+    let main_slice = &html[main_start..main_end];
+    for inside_main in [
+        r#"id="composer-area""#,
+        r#"id="results-view""#,
+        r#"id="systems-view""#,
+        r#"id="system-changes-view""#,
+    ] {
+        assert!(main_slice.contains(inside_main), "{inside_main} escaped <main>");
+    }
+    let css = client.get(format!("{base}/app.css")).send().await.unwrap().text().await.unwrap();
+    assert!(css.contains("-webkit-appearance:none"));
+    assert!(css.contains("text-overflow:ellipsis"));
+    assert!(css.contains("white-space:nowrap"));
+
     let wrote = client
         .post(format!("{base}/api/working-memory"))
         .header("x-harness-token", &token)

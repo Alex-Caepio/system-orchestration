@@ -94,13 +94,27 @@ pub fn start() -> Result<(), JsValue> {
                 return;
             }
             let id = element.id();
-            let action = element
-                .get_attribute("data-action")
-                .unwrap_or_else(|| id.clone());
+            let action = element.get_attribute("data-action").unwrap_or_else(|| {
+                if id.is_empty() && element.get_attribute("name").as_deref() == Some("theme") {
+                    "theme".to_owned()
+                } else {
+                    id.clone()
+                }
+            });
             let payload = element
                 .get_attribute("data-payload")
                 .and_then(|v| serde_json::from_str::<V>(&v).ok())
                 .unwrap_or(V::Null);
+            if k == "click" && element.class_list().contains("explain") {
+                let expanded = element.get_attribute("aria-expanded").as_deref() == Some("true");
+                let next = if expanded { "false" } else { "true" };
+                let _ = element.set_attribute("aria-expanded", next);
+                if let Some(target_id) = element.get_attribute("aria-controls") {
+                    dom::attr(&target_id, "data-visible", next);
+                    dom::hidden(&target_id, false);
+                }
+                return;
+            }
             if let Some(view) = element.get_attribute("data-view").or_else(|| {
                 element
                     .get_attribute("data-nav")

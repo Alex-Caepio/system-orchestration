@@ -119,6 +119,14 @@ pub const ROUTES: &[Route] = &[
     },
     Route {
         method: "GET",
+        pattern: "/api/app/update",
+        operation: "app.update",
+        status: 200,
+        token: false,
+        query: &["check"],
+    },
+    Route {
+        method: "GET",
         pattern: "/api/bootstrap",
         operation: "bootstrap",
         status: 200,
@@ -812,6 +820,22 @@ async fn serve(app: &App, request: Request<Body>, head: bool) -> Result<Response
         return response(
             200,
             Payload::Json(json!({"ok": true, "instance": app.instance})),
+            head,
+        );
+    }
+    if route.operation == "app.update" {
+        if let Some(check) = query["check"].as_str()
+            && check != "1"
+        {
+            return Err(HarnessError::invalid("Invalid update check parameter."));
+        }
+        return response(
+            200,
+            Payload::Json(json!({
+                "supported": false,
+                "available": false,
+                "state": "unsupported"
+            })),
             head,
         );
     }

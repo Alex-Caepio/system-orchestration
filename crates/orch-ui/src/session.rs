@@ -1838,8 +1838,12 @@ pub async fn update_status(check: bool) {
         ))
         .await
         {
+            let unsupported = v["supported"] == false;
             m::set("app-update", v);
             render_update();
+            if unsupported {
+                return;
+            }
         }
         if check {
             // A check fetches in the background: its answer is read once it has had time to arrive.
@@ -2671,15 +2675,16 @@ pub async fn event(
             add_files();
             return true;
         }
-        if let Some(e) = dom::get(id) {
-            if e.get_attribute("name").as_deref() == Some("theme") {
-                dom::save(
-                    "harness.theme.v1",
-                    if value == "system" { None } else { Some(value) },
-                );
-                apply_theme(value);
-                return true;
-            }
+        if action == "theme"
+            || dom::get(id)
+                .is_some_and(|e| e.get_attribute("name").as_deref() == Some("theme"))
+        {
+            dom::save(
+                "harness.theme.v1",
+                if value == "system" { None } else { Some(value) },
+            );
+            apply_theme(value);
+            return true;
         }
         if id == "model-routing-enabled" && checked {
             let current = json!({"model":selected_model(""),"thinking_effort":nullable(dom::value("thinking-effort"))});

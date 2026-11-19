@@ -579,18 +579,24 @@ async fn catalog_fetch(quiet_when_missing: bool) {
     let config = dom::value("system-config");
     let generation = m::read(|s| s.epochs.get("editor-scope").copied().unwrap_or(0));
     let epoch = m::next("system-catalog-load");
-    match api::post(
-        "/api/systems/catalog",
-        json!({"project_id":project,"config_path":config}),
-    )
-    .await
-    {
+    let body = if quiet_when_missing {
+        json!({"project_id": project, "config_path": config, "optional": true})
+    } else {
+        json!({"project_id": project, "config_path": config})
+    };
+    match api::post("/api/systems/catalog", body).await {
         Ok(value)
             if editor_current(&project, &config, generation)
                 && m::current("system-catalog-load", epoch) =>
         {
-            m::set("system-catalog", value.clone());
-            render_catalog(&value);
+            if m::yes(&value["missing"]) || value["catalog"].is_null() {
+                m::take("system-catalog");
+                dom::hidden("system-catalog", true);
+                layout();
+            } else {
+                m::set("system-catalog", value.clone());
+                render_catalog(&value);
+            }
         }
         Err(error)
             if editor_current(&project, &config, generation)

@@ -474,15 +474,30 @@ impl SystemManager {
             "systems.preview" | "systems.edit.preview" => editor.preview(&self.state, data),
             "systems.apply" | "systems.edit.apply" => editor.apply(&self.state, data),
             "systems.catalog" => {
-                fields(data, &["project_id", "config_path"], &[])?;
-                let system = self.system(
+                fields(data, &["project_id", "config_path"], &["optional"])?;
+                let optional = match data.get("optional") {
+                    None => false,
+                    Some(Value::Bool(flag)) => *flag,
+                    Some(_) => return Err(fail("optional must be boolean")),
+                };
+                match self.system(
                     &editor,
                     string(&data["project_id"]),
                     string(&data["config_path"]),
-                )?;
-                Ok(
-                    object!({"catalog":system.catalog(),"diagram":system.diagram(),"root":system.root}),
-                )
+                ) {
+                    Ok(system) => Ok(
+                        object!({"catalog":system.catalog(),"diagram":system.diagram(),"root":system.root}),
+                    ),
+                    Err(error) if optional && error.kind == orch_core::ErrorKind::NotFound => {
+                        Ok(object!({
+                            "missing": true,
+                            "catalog": Value::Null,
+                            "diagram": Value::Null,
+                            "root": Value::Null
+                        }))
+                    }
+                    Err(error) => Err(error),
+                }
             }
             "systems.prepare" => self.prepare(&editor, data),
             "systems.list" => {
