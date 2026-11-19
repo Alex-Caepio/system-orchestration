@@ -1,0 +1,20 @@
+[workspace]
+members = ["crates/orch-core", "crates/orch-host", "crates/orch-system", "crates/orch-harness", "crates/orch-ui", "crates/orch-cli"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "debuginfo"
+
+[profile.test]
+debug = 0
+
+[profile.dev.package."*"]
+opt-level = 3

@@ -1,0 +1,22 @@
+[package]
+name = "orch-system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[dependencies]
+anyhow = "1"
+orch-core = { path = "../orch-core" }
+orch-host = { path = "../orch-host" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["preserve_order", "arbitrary_precision"] }
+regex = "1"
+uuid = { version = "=1.22.0", features = ["v4", "serde"] }
+chrono = "=0.4.45"
+rusqlite = { version = "=0.37.0", features = ["bundled", "modern_sqlite"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
+libc = "=0.2.191"
+
+[dev-dependencies]
+tempfile = "3"

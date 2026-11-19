@@ -1,0 +1,41 @@
+{
+  "description": "System Orchestration lifecycle hooks for Codex CLI subagent gating and mailbox dispatch relay.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/orch-engine\" hook subagent-gate --host codex",
+            "timeout": 10,
+            "statusMessage": "Checking orchestration subagent gate"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/orch-engine\" hook subagent-dispatch --host codex",
+            "timeout": 10,
+            "statusMessage": "Checking orchestration dispatch mailbox"
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${PLUGIN_ROOT}/bin/orch-engine\" hook subagent-dispatch --host codex",
+            "timeout": 10,
+            "statusMessage": "Recording subagent completion receipt"
+          }
+        ]
+      }
+    ]
+  }
+}

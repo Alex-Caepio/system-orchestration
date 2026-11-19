@@ -1,0 +1,285 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <meta name="description" content="A local workspace for AI Infrastructure sessions, project context, and accelerators.">
+  <title>System Orchestration</title>
+  <link rel="icon" type="image/svg+xml" href="/icons/logo.svg">
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <a class="skip" href="#main">Skip to main content</a>
+  <div class="app">
+    <button class="scrim" id="scrim" type="button" aria-label="Close navigation"></button>
+    <aside class="sidebar" id="sidebar" aria-label="Workspace navigation">
+      <div class="brand"><img class="brand-logo" src="/icons/logo.svg" alt="" width="34" height="34"><div><div class="brand-name">System Orchestration</div><div class="brand-subtitle">Workspace</div></div></div>
+      <div class="project-switcher"><label for="project-switcher">Project</label><select id="project-switcher"><option value="">Loading projects…</option></select></div>
+      <button class="new-session" id="new-session" type="button"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 5v14 M5 12h14"/></svg>New session</button>
+      <nav class="navigation" aria-label="Main navigation">
+        <button class="nav-item" type="button" data-nav="sessions" aria-current="page"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M4 4h16v12H9l-5 4Z"/></svg>Sessions</button>
+        <button class="nav-item" type="button" data-nav="systems"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M3.5 4.5h6v5h-6Z M14.5 4.5h6v5h-6Z M9 14.5h6v5H9Z M9.5 7h5 M6.5 9.5v7.5H9 M17.5 9.5v7.5H15"/></svg>System Orchestration</button>
+      </nav>
+      <div class="history-header"><span>Recent sessions</span><div class="history-actions"><button class="history-action" id="merge-chats" type="button" aria-haspopup="dialog" aria-label="Merge chats into a new task" title="Merge chats: start a new task from 2–8 finished chats of this project">Merge</button><button class="icon-button" id="refresh-sessions" type="button" aria-label="Refresh sessions"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M20 11a8 8 0 1 0-2 6 M20 4v7h-7"/></svg></button></div></div>
+      <div class="history" id="history"><p class="history-empty">Connecting to the local runner…</p></div>
+      <div class="sidebar-footer"><strong id="runtime-label">Local runner</strong><span id="runtime-detail" hidden></span>
+        <div class="theme-control"><span id="theme-label">Theme</span><div class="theme-switch" role="radiogroup" aria-labelledby="theme-label"><label title="Match the system theme"><input type="radio" name="theme" value="system"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M3 4h18v12H3Z M8 20h8 M12 16v4"/></svg><span class="sr-only">System</span></label><label title="Light theme"><input type="radio" name="theme" value="light"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2.5 M12 19.5V22 M2 12h2.5 M19.5 12H22 M4.9 4.9l1.8 1.8 M17.3 17.3l1.8 1.8 M4.9 19.1l1.8-1.8 M17.3 6.7l1.8-1.8"/></svg><span class="sr-only">Light</span></label><label title="Dark theme"><input type="radio" name="theme" value="dark"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3 7 7 0 0 0 21 12.8Z"/></svg><span class="sr-only">Dark</span></label></div></div></div>
+    </aside>
+    <main class="main" id="main" tabindex="-1">
+      <header class="topbar"><div class="topbar-heading"><button class="icon-button menu-toggle" id="menu-toggle" type="button" aria-label="Open navigation" aria-controls="sidebar" aria-expanded="false"><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M4 6h16 M4 12h16 M4 18h16"/></svg></button><div class="topbar-title"><h1 id="page-title">System Orchestration</h1><p id="page-subtitle">Your local workspace for agent sessions</p></div></div><div class="header-actions"><span class="status" id="session-status" role="status" hidden></span><button type="button" class="button danger" id="cancel-session" hidden>Cancel session</button></div></header>
+      <nav class="view-tabs" id="view-tabs" aria-label="Section views" hidden></nav>
+      <h2 class="sr-only" id="view-heading" tabindex="-1"></h2>
+      <div class="banner" id="connection-banner" role="alert" hidden><p id="connection-message"></p><button type="button" class="button compact" id="reconnect">Reconnect</button></div><div class="banner update-banner" id="app-update-banner" role="status" hidden><p id="app-update-note"></p></div>
+      <div class="connection-loading" id="connecting" role="status">Loading projects and native providers…</div>
+      <section class="view" id="sessions-view" aria-label="Agent sessions">
+        <div class="configuration">
+          <div class="session-summary" id="session-summary" hidden><p class="session-summary-text" id="session-summary-text"></p><button class="button compact" id="session-settings-toggle" type="button" aria-expanded="false" aria-controls="session-settings">Next-turn settings</button></div>
+          <p class="provider-hint" id="provider-hint" role="status" hidden></p>
+          <div class="session-settings" id="session-settings">
+          <div class="settings-grid">
+            <label class="field" data-project-field>Project<select id="project" form="session-form" required><option value="">Loading projects…</option></select></label>
+            <label class="field">Provider<select id="provider" form="session-form" required aria-describedby="provider-hint"><option value="">Loading providers…</option></select></label>
+            <label class="field">Workflow<select id="workflow" form="session-form" required><option value="native">Native</option></select></label>
+            <label class="field">Mode<select id="mode" form="session-form"><option value="plan">Plan</option><option value="edit">Edit</option></select></label>
+            <div class="field model-field"><span class="field-label"><label for="model-choice">Model</label><button class="explain" type="button" aria-controls="model-hint" aria-expanded="false" aria-label="About model choices">?</button></span><select id="model-choice" form="session-form" aria-describedby="model-hint"><option value="">Provider default</option></select></div>
+            <label class="field">Thinking effort<select id="thinking-effort" form="session-form" aria-describedby="model-hint agent-mode-error"><option value="">Provider default</option></select></label>
+          </div>
+          <div class="model-details"><label class="field" id="custom-model-field" hidden>Custom model ID<input id="model" form="session-form" type="text" placeholder="Exact native model ID" autocomplete="off" maxlength="120" aria-describedby="model-hint model-error" disabled></label><p class="model-hint" id="model-hint"></p><p class="model-error" id="model-error" role="alert" hidden></p><p class="model-error" id="agent-mode-error" role="alert" hidden></p></div>
+          <section class="brain-link-config" id="sdd-settings" aria-label="Spec-Driven Development" hidden>
+            <div class="knowledge-form-grid">
+              <label class="field">Feature slug<input id="sdd-feature" form="session-form" maxlength="80" pattern="[a-z0-9]+(-[a-z0-9]+)*" placeholder="user-authentication" aria-describedby="sdd-slug-hint sdd-hint sdd-error" disabled>
+              <span class="workspace-helper" id="sdd-slug-hint">Lowercase letters, digits and single hyphens; not “memory”.</span></label><label class="field">SDD phase<select id="sdd-phase" form="session-form" aria-describedby="sdd-hint" disabled></select></label>
+            </div>
+            <p class="knowledge-note" id="sdd-hint" role="status"></p>
+            <p class="knowledge-note">Phases never advance on their own. Writing phases have full edit access, and only instructions keep them to their documents; Review only reads.</p>
+            <p class="error-text" id="sdd-error" role="alert" hidden></p>
+            <button class="button" type="button" id="sdd-refresh" disabled>Read SDD documents</button>
+            <div id="sdd-documents"></div>
+          </section>
+          <div class="fleet-settings" id="fleet-settings" hidden><fieldset aria-describedby="fleet-config-error"><legend>Reviewers</legend><div class="fleet-lenses" id="fleet-lenses"></div></fieldset><div class="fleet-settings-row"><label class="checkbox"><input id="fleet-dry-run" form="session-form" type="checkbox" aria-describedby="fleet-runtime-detail">Offline dry-run</label><label class="field">Budget USD (optional)<input id="fleet-budget" form="session-form" type="number" min="0.01" max="1000" step="any" placeholder="No budget" aria-describedby="fleet-budget-hint fleet-config-error"></label><label class="field">Reviewer timeout (seconds)<input id="fleet-worker-timeout" form="session-form" type="number" min="1" max="3600" step="1" value="300" required aria-describedby="fleet-config-error"></label></div><p class="fleet-note" id="fleet-budget-hint"></p><p class="fleet-note" id="fleet-runtime-detail"></p><p class="fleet-error" id="fleet-config-error" role="alert" hidden></p></div>
+          <div class="option-bar" role="group" aria-label="Session options">
+            <button class="chip" type="button" id="option-project" aria-expanded="false" aria-controls="panel-project">Project<span class="chip-value" id="option-project-value"></span><span class="chip-caret" aria-hidden="true"></span></button>
+            <button class="chip" type="button" id="option-helpers" aria-expanded="false" aria-controls="panel-helpers"><span id="option-helpers-label">Helpers</span><span class="chip-value" id="option-helpers-value"></span><span class="chip-caret" aria-hidden="true"></span></button>
+            <button class="chip" type="button" id="option-clash" aria-expanded="false" aria-controls="panel-clash">Clash<span class="chip-value" id="option-clash-value"></span><span class="chip-caret" aria-hidden="true"></span></button>
+            <button class="chip" type="button" id="option-workspace" aria-expanded="false" aria-controls="panel-workspace">Run in<span class="chip-value" id="option-workspace-value"></span><span class="chip-caret" aria-hidden="true"></span></button>
+            <button class="chip" type="button" id="option-budgets" aria-expanded="false" aria-controls="panel-budgets">Budgets<span class="chip-value" id="option-budgets-value"></span><span class="chip-caret" aria-hidden="true"></span></button>
+            <button class="chip" type="button" id="option-models" aria-expanded="false" aria-controls="panel-models">Models<span class="chip-value" id="model-routing-summary"></span><span class="chip-caret" aria-hidden="true"></span></button>
+          </div>
+          <div class="option-panel" id="panel-project" role="region" aria-labelledby="option-project" hidden><div class="project-choice"><p class="knowledge-note" id="project-panel-path"></p><button class="button" id="project-choose-folder" type="button">Choose a project folder…</button></div><p class="error-text" id="project-choose-error" role="alert" hidden></p>
+          </div>
+          <div class="option-panel" id="panel-helpers" role="region" aria-labelledby="option-helpers" hidden>
+          <div class="agent-options"><label class="checkbox"><input id="agents-enabled" form="session-form" type="checkbox" aria-describedby="agent-hint agent-mode-error">Use additional agents</label><label class="agent-count-field" for="agent-count"><span id="agent-count-label">Required helpers</span><input id="agent-count" form="session-form" type="number" min="1" max="40" step="1" value="3" required disabled aria-describedby="agent-hint agent-count-error"></label><p class="agent-hint" id="agent-hint"></p><p class="agent-error" id="agent-count-error" role="alert" hidden></p></div>
+          </div>
+          <div class="option-panel" id="panel-clash" role="region" aria-labelledby="option-clash" hidden>
+          <div class="agent-options"><label class="checkbox"><input id="clash-enabled" form="session-form" type="checkbox" aria-describedby="clash-availability clash-error">Clash with a challenger</label><p class="agent-hint" id="clash-availability">A second provider disputes the result.</p></div>
+          <section class="brain-link-config" id="clash-settings" aria-label="Clash settings" hidden>
+            <div class="knowledge-form-grid">
+              <label class="field">Challenger<select id="clash-challenger" form="session-form" aria-describedby="clash-hint clash-error"></select></label>
+              <label class="field">Challenge rounds<input id="clash-rounds" form="session-form" type="number" min="1" max="3" step="1" value="2" aria-describedby="clash-hint clash-error"></label>
+              <label class="field">Challenger model<select id="clash-model-choice" form="session-form" aria-describedby="clash-error"></select></label>
+              <label class="field" id="clash-custom-field" hidden>Challenger custom model ID<input id="clash-model" form="session-form" type="text" maxlength="120" autocomplete="off" placeholder="Exact native model ID" aria-describedby="clash-error" disabled></label>
+              <label class="field">Challenger thinking effort<select id="clash-thinking-effort" form="session-form" aria-describedby="clash-error"></select></label>
+            </div>
+            <p class="knowledge-note" id="clash-hint" role="status"></p>
+            <p class="knowledge-note">The settings above define the first participant. The challenger is read-only; neither side starts helpers. The final verdict ends each cycle.</p>
+            <p class="error-text" id="clash-error" role="alert" hidden></p>
+          </section>
+          </div>
+          <div class="option-panel" id="panel-workspace" role="region" aria-labelledby="option-workspace" hidden>
+          <div class="workspace-options"><label class="field">Workspace<select id="workspace" form="session-form" aria-describedby="workspace-hint workspace-error"><option value="project">Current project folder</option><option value="worktree" id="workspace-worktree-option" disabled>New Git worktree</option><option value="existing-worktree" id="workspace-existing-option" disabled>Existing Git worktree</option></select></label><label class="field worktree-branch-field" id="worktree-branch-field" hidden>New branch (optional)<input id="worktree-branch" form="session-form" type="text" maxlength="256" placeholder="Automatic: codex/harness-…" autocomplete="off" spellcheck="false" aria-describedby="worktree-branch-hint" disabled><span class="workspace-helper" id="worktree-branch-hint">Leave blank for an automatic branch name.</span></label><label class="field existing-worktree-field" id="existing-worktree-field" hidden>Worktree<select id="existing-worktree" form="session-form" aria-describedby="existing-worktree-hint" disabled></select></label><div class="workspace-git"><div class="workspace-git-header"><span id="project-git-status" role="status">Choose a project to check its Git branch.</span><button class="button" id="refresh-project-git" type="button" aria-label="Refresh Git status" disabled>Refresh Git</button></div><p class="workspace-hint" id="workspace-hint">The agent runs in the selected project folder.</p></div><p class="workspace-session-info workspace-session-path" id="existing-worktree-hint" hidden></p><p class="workspace-error" id="workspace-error" role="alert" hidden></p><p class="workspace-session-info" id="workspace-session-info" hidden><span id="workspace-session-branch"></span><span class="workspace-session-path" id="workspace-session-path"></span></p></div>
+          </div>
+          </div>
+          </div>
+          <div class="option-panel" id="panel-budgets" role="region" aria-labelledby="option-budgets" hidden>
+          <div id="session-budgets"></div>
+          </div>
+          <div class="option-panel" id="panel-models" role="region" aria-labelledby="option-models" hidden>
+          <div class="option-panel-body" id="model-routing-config">
+            <label class="checkbox"><input id="model-routing-enabled" type="checkbox">Use separate planning and editing models</label>
+            <p class="knowledge-note">Plan mode uses the Planning model and Edit mode the Editing model; in SDD only Implement uses Editing.</p>
+            <div class="knowledge-form-grid" id="model-routing-fields" hidden></div>
+            <p class="knowledge-note" id="model-routing-hint" role="status"></p>
+            <p class="error-text" id="model-routing-error" role="alert" hidden></p>
+          </div>
+          </div>
+          </div>
+        </div>
+        <div class="output-resizer" id="output-resizer" role="separator" tabindex="0" aria-label="AI output height" aria-orientation="horizontal" aria-controls="conversation" aria-valuemin="0" aria-valuemax="100" aria-valuenow="50" title="Drag up to expand AI output. Use Up/Down arrows, or double-click to reset."></div>
+        <div class="conversation" id="conversation"><div class="conversation-inner">
+          <div class="welcome" id="welcome"><img class="welcome-mark" src="/icons/logo.svg" alt="" width="48" height="48"><h2>What are we working on?</h2><div class="welcome-links"><button class="button primary" type="button" id="welcome-choose-folder">Choose a project folder</button><button class="button" type="button" data-view="systems">Open System Orchestration</button></div></div>
+          <section class="fleet-progress" id="fleet-progress" aria-label="Fleet review progress" hidden><div class="fleet-progress-header"><h2>Fleet review</h2><span class="fleet-stage" id="fleet-stage" role="status"></span></div><p class="fleet-note" id="fleet-run-detail"></p><p class="fleet-note" id="fleet-brain-note" hidden></p><div class="fleet-reviewers" id="fleet-reviewers" aria-label="Reviewer progress"></div><div class="fleet-actions" id="fleet-resume-actions" hidden><button class="button" id="fleet-resume" type="button">Resume review</button><span class="fleet-note">Continue from the saved checkpoint. Save budget changes first; earlier spending still counts.</span></div><p class="fleet-error" id="fleet-action-error" role="alert" hidden></p></section>
+          <div id="events" role="log" aria-label="Session messages" aria-live="polite" aria-relevant="additions"></div>
+          <section class="fleet-outcome" id="clash-outcome" aria-label="Clash ledger and outcome" hidden><h3 id="clash-outcome-title">Clash ledger</h3><p class="fleet-note" id="clash-outcome-summary" role="status"></p><p class="fleet-note" id="clash-verdict-note" hidden></p><div class="fleet-findings" id="clash-items"></div><details class="fleet-report" id="clash-turns"><summary>Turns</summary><div id="clash-turn-list"></div></details><details class="fleet-report" id="clash-report" hidden><summary>Ledger report</summary><pre class="fleet-report-text" id="clash-report-text" tabindex="0"></pre></details></section>
+          <section class="fleet-outcome" id="fleet-outcome" aria-label="Fleet review findings and report" hidden><h3 id="fleet-outcome-title">Review findings</h3><p class="fleet-note" id="fleet-result-summary" role="status"></p><p class="fleet-note" id="fleet-skipped" hidden></p><div class="fleet-findings" id="fleet-findings"></div><details class="fleet-report" id="fleet-report" hidden><summary>Report preview</summary><pre class="fleet-report-text" id="fleet-report-text" tabindex="0"></pre></details><p class="fleet-note" id="fleet-decision-hint"></p><div class="fleet-actions"><div class="fleet-actions" id="fleet-decision-actions" hidden><button class="button primary" id="fleet-approve" type="button">Approve report</button><button class="button" id="fleet-reject" type="button">Reject report</button></div><a class="button" id="fleet-download" download hidden>Download report</a></div></section>
+          <p class="error-text" id="events-error" role="alert" hidden></p>
+        </div></div>
+        <section class="run-view" id="run-view" aria-label="Run" data-open="false" inert><div class="run-clip"><div class="run-wrap"><div class="run-card" id="run-card" data-detailed="false">
+          <div class="run-panel-wrap"><div class="run-panel-clip"><section class="run-panel" id="run-panel" aria-label="Run details" inert>
+            <div class="run-tabs" id="run-tabs" role="tablist" aria-label="Run details"><button type="button" class="run-tab" role="tab" id="run-tab-files" data-tab="files" aria-controls="run-pane-files" aria-selected="true">Files <span class="run-badge" id="run-badge-files"></span></button><button type="button" class="run-tab" role="tab" id="run-tab-plan" data-tab="plan" aria-controls="run-pane-plan" aria-selected="false" tabindex="-1" hidden>Plan <span class="run-badge" id="run-badge-plan"></span></button><button type="button" class="run-tab" role="tab" id="run-tab-commands" data-tab="commands" aria-controls="run-pane-commands" aria-selected="false" tabindex="-1" hidden>Commands <span class="run-badge" id="run-badge-commands"></span></button></div>
+            <div class="run-pane" role="tabpanel" id="run-pane-files" aria-labelledby="run-tab-files" tabindex="0">
+              <div class="run-files-head"><p class="run-files-summary" id="run-files-summary"></p><div class="run-seg" id="run-files-view" role="group" aria-label="File view"><button type="button" id="run-view-map" aria-pressed="true">Map</button><button type="button" id="run-view-list" aria-pressed="false">List</button></div></div>
+              <div class="run-filters" id="run-files-filters" role="group" aria-label="Show files"></div>
+              <p class="run-caption" id="run-files-caption">Only files named in a tool call. Untouched files are not shown.</p>
+              <p class="run-caption" id="run-files-note" hidden></p>
+              <p class="run-banner" id="run-files-banner" hidden>File map stops here: later file activity in this launch is not recorded.</p>
+              <p class="run-empty" id="run-files-empty">Files the agent opens appear here.</p>
+              <div class="run-map" id="run-map" aria-live="off"><div class="run-map-main" id="run-map-main"></div><div class="run-map-rows" id="run-map-rows"></div></div>
+              <ul class="run-tree" id="run-tree" role="tree" aria-label="Files named in tool calls" hidden></ul>
+              <p class="run-legend" id="run-legend" aria-hidden="true"><span class="run-file"><bdi class="run-file-name">opened</bdi></span><span class="run-file" data-edited="true"><bdi class="run-file-name">edited</bdi></span><span class="run-file" data-edited="true" data-created="true"><span class="run-file-mark">+</span><bdi class="run-file-name">created</bdi></span><span class="run-file" data-failed="true"><span class="run-file-mark">!</span><bdi class="run-file-name">failed</bdi></span><span class="run-file" data-deleted="true" data-edited="true"><bdi class="run-file-name">deleted</bdi></span><span class="run-file"><bdi class="run-file-name">re-opened</bdi><span class="run-file-count">×N</span></span><span class="run-file" data-helper="true"><bdi class="run-file-name">helper</bdi></span><span class="run-file" data-now="static"><bdi class="run-file-name">now</bdi></span><span>⌕ searched folder</span></p>
+            </div>
+            <div class="run-pane" role="tabpanel" id="run-pane-plan" aria-labelledby="run-tab-plan" tabindex="0" hidden></div>
+            <div class="run-pane" role="tabpanel" id="run-pane-commands" aria-labelledby="run-tab-commands" tabindex="0" hidden></div>
+          </section></div></div>
+          <div class="run-strip" id="run-strip" aria-live="off">
+            <div class="waiting" id="waiting" hidden><span class="status-dot running"></span><span id="waiting-text">Session running…</span></div>
+            <button type="button" class="run-now" id="run-now" hidden><span class="run-dot" id="run-dot" aria-hidden="true"></span><span class="run-now-text" id="run-now-text"><span class="run-verb" id="run-verb"></span><bdi dir="ltr" class="run-target" id="run-target"></bdi><span class="run-more" id="run-more"></span></span><span class="run-clock" id="run-clock" aria-hidden="true"></span></button>
+            <div class="run-line2" id="run-line2" hidden>
+              <div class="run-chips" id="run-chips"></div><button type="button" class="run-compact" id="run-compact" aria-pressed="false"></button>
+              <p class="run-quiet" id="run-quiet" hidden></p>
+              <div class="run-away" id="run-away" hidden><span class="run-away-text" id="run-away-text"></span><button type="button" class="button compact" id="run-away-jump">Jump to new activity</button><button type="button" class="icon-button" id="run-away-close" aria-label="Dismiss the away summary">×</button></div>
+              <button type="button" class="run-link" id="run-notify" hidden>Notify me when it finishes</button><button type="button" class="run-link" id="run-close" hidden>Close</button>
+              <div class="run-seg run-mode" role="group" aria-label="Run view detail"><button type="button" id="run-calm" aria-pressed="true">Calm</button><button type="button" id="run-detailed" aria-pressed="false">Detailed</button></div>
+            </div>
+          </div>
+        </div></div></div></section>
+        <p class="sr-only" id="run-announcer" role="status"></p>
+        <div class="composer-area" id="composer-area"><div class="composer-wrap"><section class="merge-context" id="merge-context" aria-labelledby="merge-context-title" hidden><div class="merge-context-head"><h3 id="merge-context-title">Merged chats</h3><div class="merge-context-actions"><button class="button compact" id="merge-archive" type="button" aria-expanded="false" aria-controls="merge-archive-content" hidden>View saved context</button><button class="button compact primary" id="merge-restart" type="button" hidden>Restart merged task</button><button class="button compact" id="merge-delete" type="button" hidden>Delete saved context</button><button class="button compact" id="merge-delete-keep" type="button" hidden>Keep it</button><button class="button compact" id="merge-clear" type="button" hidden>Cancel merge</button></div></div><p class="knowledge-note" id="merge-context-note"></p><div class="merge-sources" id="merge-context-sources"></div><div class="merge-archive" id="merge-archive-content" tabindex="0" role="region" aria-label="Saved merged context" hidden></div></section><p class="knowledge-note inbox-hint" id="inbox-hint" role="status" hidden></p><p class="error-text" id="inbox-error" role="alert" hidden></p><section class="session-inbox" id="session-inbox" aria-labelledby="inbox-title" hidden><h3 id="inbox-title">Next messages</h3><ul id="inbox-receipts" class="inbox-receipts" aria-label="Recent next-message receipts"></ul></section><p class="error-text" id="composer-error" role="alert" hidden></p><p class="composer-notice" id="composer-notice" role="status" hidden></p><form class="composer" id="session-form" novalidate><label class="sr-only" id="prompt-label" for="prompt">Task or follow-up message</label><div class="skill-hints" id="skill-hints-panel" hidden><ul class="skill-hints-list" id="skill-hints" role="listbox" aria-label="Commands and skills"></ul><p class="skill-hints-note" id="skill-hints-note" hidden></p></div><p class="sr-only" id="skill-hints-status" role="status"></p><textarea id="prompt" placeholder="Describe a task for this project…" required rows="3"></textarea><input id="attachment-input" type="file" multiple hidden><div class="attachment-list" id="attachment-list" aria-label="Files to attach" hidden></div><p class="error-text" id="attachment-error" role="alert" hidden></p><div class="composer-actions"><button class="button attach-button" id="attach-files" type="button" aria-describedby="attachment-hint">Attach files</button><button class="button" id="add-task-context" type="button" aria-haspopup="dialog">Add task context</button><span class="composer-note" id="composer-note">Ctrl / ⌘ + Enter to send</span><button class="context-meter" id="context-meter" type="button" hidden><meter id="context-meter-bar" min="0" max="1" value="0"></meter><span id="context-meter-text"></span></button><button class="button primary" id="send" type="submit" disabled><span id="send-label">Start session</span><svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M12 19V5 M6 11l6-6 6 6"/></svg></button></div><p class="composer-note" id="attachment-hint" hidden>Up to 5 files · 4 MiB each · 8 MiB total. Files are sent with your message.</p></form><p class="composer-caption" id="composer-caption" hidden></p></div></div>
+      </section>
+      <section class="view" id="results-view" aria-label="Results and verification" hidden><div class="page-scroll"><div class="page-content">
+        <div class="page-toolbar results-toolbar"><p class="results-workspace" id="results-workspace"></p><button type="button" class="button" id="results-refresh">Refresh results</button></div>
+        <p class="error-text" id="results-error" role="alert" hidden></p>
+        <p id="results-status" role="status"></p>
+        <details class="fleet-report" data-tab="changes" open><summary>Changed files &amp; diff</summary><p class="knowledge-note" id="results-base"></p><p class="knowledge-note" id="results-diff-note"></p><pre class="fleet-report-text" id="results-files" tabindex="0"></pre><pre class="fleet-report-text" id="results-diff" tabindex="0"></pre></details>
+        <section id="delivery-section" data-tab="changes" aria-labelledby="delivery-heading"><h3 id="delivery-heading">Worktree delivery</h3>
+          <p class="knowledge-note" id="delivery-availability">Loading delivery options…</p><p class="error-text" id="delivery-error" role="alert" hidden></p><p id="delivery-status" role="status"></p>
+          <div id="delivery-options" hidden>
+            <p class="knowledge-note" id="delivery-workspace"></p>
+            <form id="delivery-commit-form"><h4>1. Commit selected files</h4><p class="knowledge-note">Pending changes against the worktree HEAD. Selecting a file commits its whole current content, staged and unstaged.</p>
+              <div class="file-list" id="delivery-files" role="group" aria-label="Files to commit"></div>
+              <div class="page-toolbar"><label class="field" style="flex:1;max-width:100%">Commit message<input type="text" id="delivery-message" maxlength="4000" aria-describedby="delivery-message-error" required></label></div><p class="error-text" id="delivery-message-error" hidden></p><button type="submit" class="button" id="delivery-commit-preview-button" disabled>Preview selected files</button>
+            </form>
+            <div id="delivery-commit-preview" hidden><p class="knowledge-note" id="delivery-commit-summary"></p><pre class="fleet-report-text" id="delivery-commit-files" tabindex="0"></pre><pre class="fleet-report-text" id="delivery-commit-diff" tabindex="0"></pre><p class="knowledge-note" id="delivery-commit-checks"></p><p class="knowledge-note" id="delivery-commit-note"></p><button type="button" class="button" id="delivery-commit" disabled>Commit reviewed files locally</button></div>
+            <form id="delivery-preview-form"><h4>2. Preview one commit on a local branch</h4><p class="knowledge-note">Pick one commit; the preview checks that it applies to the target branch.</p>
+              <div class="page-toolbar"><label class="field">Commit<select id="delivery-source" required></select></label><label class="field">Target local branch<select id="delivery-target" required></select></label></div>
+              <label class="checkbox"><input type="checkbox" id="delivery-check-required" checked>Require a target check before Apply</label>
+              <div class="page-toolbar"><label class="field" style="flex:1">Target check command<input type="text" id="delivery-check-command" maxlength="4000" placeholder="e.g. python3 -m unittest tests.test_example"></label><label class="field">Timeout (seconds)<input type="number" id="delivery-check-timeout" min="1" max="3600" value="300" step="1"></label></div>
+              <p class="knowledge-note">Runs only when you click Run target checks, in a temporary worktree of the result — no dependencies or ignored files. One trusted command, no shell operators, no model.</p><button type="submit" class="button" id="delivery-preview-button" disabled>Preview transfer</button>
+            </form>
+            <div id="delivery-preview" hidden><h4>3. Review and apply</h4><p class="knowledge-note" id="delivery-preview-summary"></p><pre class="fleet-report-text" id="delivery-preview-files" tabindex="0"></pre><pre class="fleet-report-text" id="delivery-preview-diff" tabindex="0"></pre><p class="knowledge-note" id="delivery-preview-checks"></p><p class="knowledge-note" id="delivery-preview-note"></p><p class="knowledge-note" id="delivery-check-status" role="status"></p><pre class="fleet-report-text" id="delivery-check-output" tabindex="0"></pre><button type="button" class="button" id="delivery-run-check" disabled>Run target checks</button><button type="button" class="button" id="delivery-cancel-check" hidden>Cancel target check</button><button type="button" class="button primary" id="delivery-apply" disabled>Apply reviewed commit locally</button></div>
+          </div>
+        </section>
+        <section data-tab="checks" aria-label="Run verification"><h3>Run a project check</h3><p class="knowledge-note">Runs in this session's workspace and may change files. One trusted command, no shell operators, no model.</p>
+          <form id="check-form"><div class="page-toolbar"><label class="field" style="flex:1">Check command<input type="text" id="check-command" maxlength="4000" placeholder="e.g. python3 -m unittest tests.test_example" required></label><label class="field">Check timeout (seconds)<input type="number" id="check-timeout" min="1" max="3600" step="1" value="300" required></label></div><p class="knowledge-note" id="check-prefill-note" role="status" hidden></p><button class="button primary" type="submit" id="check-start" disabled>Run check</button></form>
+          <p class="knowledge-note">Passed means exit code 0, not that the project is verified.</p><div id="results-checks"></div>
+        </section>
+        <section data-tab="usage" aria-label="Launch usage history"><section class="context-usage" id="context-usage" aria-label="Context window" hidden></section><h3>Launch history &amp; total usage</h3><p class="knowledge-note" id="results-usage-note"></p><p id="results-totals" role="status"></p><div id="results-launches"></div></section>
+      </div></div></section>
+      <section class="view" id="systems-view" aria-label="System services" hidden><div class="page-scroll"><div class="page-content">
+        <div class="page-toolbar system-toolbar">
+          <label class="field" data-project-field>System folder<select id="system-project"></select></label>
+          <label class="field system-file">System file<input id="system-config" value="system.json" maxlength="1024" placeholder="Relative path to system.json" spellcheck="false" autocomplete="off"></label>
+          <button class="button" type="button" id="system-load">Load system</button>
+          <button class="button" type="button" id="system-edit">Edit system</button>
+          <button class="button" type="button" id="system-choose-project">Choose system folder…</button>
+        </div>
+        <p class="error-text" id="system-error" role="alert" hidden></p><p class="skills-action-status" id="system-message" role="status"></p>
+        <div class="system-empty" id="system-empty"><h3>No system loaded</h3><p class="system-note">Load this project's system file, or create the system from its service folders. <strong>Choose system folder…</strong> adds another folder to your projects and makes it the working project in every view.</p></div>
+        <form id="system-editor" class="system-editor" hidden aria-labelledby="system-editor-title" novalidate>
+          <div class="system-editor-head"><h3 id="system-editor-title">Edit system</h3><p class="system-note" id="system-editor-location"></p></div>
+          <label class="field system-name-field">System name<input id="system-editor-name" type="text" required maxlength="200"></label>
+          <section class="system-fill" aria-labelledby="system-fill-title">
+            <h4 id="system-fill-title">Fill details with AI</h4>
+            <p class="system-note">AI reads a bounded copy of each service folder (code, interfaces, policies, tests and eligible memory; secrets and dependency trees are left out) and fills the forms below. Your folders stay read-only; review the result before saving.</p>
+            <p class="system-warning" id="system-discovery-sandbox" role="alert" hidden></p>
+            <div class="system-fill-row"><label class="field">Provider<select id="system-discovery-provider"></select></label><label class="field system-timeout">Timeout, seconds<input id="system-discovery-timeout" type="number" value="900" min="1" max="86400"></label><button class="button primary" type="button" id="system-discovery-start">Fill with AI</button><button class="button" type="button" id="system-discovery-cancel" hidden>Cancel AI scan</button></div>
+            <p class="skills-action-status" id="system-discovery-status" role="status"></p>
+            <section class="agents-section" id="system-discovery-agents" aria-label="AI scan agent" hidden><div class="agents-toolbar"><h5>Agent</h5><span class="agents-live" id="system-discovery-live" hidden>Live</span></div><p class="system-note">Paths map back to the original service folders.</p><div id="system-discovery-agent"></div></section>
+            <div id="system-discovery-report" class="system-discovery-report" hidden></div>
+          </section>
+          <div class="system-editor-services-head"><h4>Services</h4><p class="system-note">Added folders join your projects.</p></div>
+          <div id="system-editor-services"></div>
+          <div class="skills-actions"><button class="button" type="button" id="system-editor-add">Add service folder</button></div>
+          <details class="system-details"><summary>Shared sources of context</summary><p class="system-note">Paths relative to the system folder: policies, specifications or memory shared across services.</p><div id="system-editor-shared"></div></details>
+          <p class="error-text" id="system-editor-error" role="alert" hidden></p>
+          <div class="skills-actions system-editor-actions"><p class="skills-action-status" id="system-editor-status" role="status"></p><p class="system-note system-save-note">Save writes the system file and ai-service.json in each service folder.</p><button class="button" type="button" id="system-editor-discard">Discard changes</button><button class="button" type="button" id="system-editor-close">Close editor</button><button class="button primary" type="submit" id="system-editor-save">Save system</button></div>
+        </form>
+        <div id="system-catalog" class="system-catalog" hidden>
+          <div class="system-heading"><div><h3 id="system-name"></h3><p class="system-note" id="system-catalog-summary"></p></div><button class="button primary" type="button" id="system-plan-change">Plan a change</button></div>
+          <div class="system-map" id="system-map"></div>
+          <div class="system-cards" id="system-services"></div>
+          <details class="system-details"><summary>Contracts and memory ownership</summary><div id="system-relationships"></div><p class="system-note">System Brain coordinates the change. Each service owns its tasks and Memory Bank. Local SQLite indexes are disposable. Receipts become durable knowledge only through the owning runtime’s review and promotion workflow.</p><div id="system-banks" class="system-cards"></div></details>
+        </div>
+      </div></div></section>
+      <section class="view" id="system-changes-view" aria-label="System changes" hidden><div class="page-scroll"><div class="page-content">
+        <div class="page-toolbar system-runs-bar"><label class="field">Change<select id="system-runs"><option value="">No changes yet</option></select></label><button type="button" class="button" id="system-refresh">Refresh</button><button type="button" class="button" id="system-new-change" aria-controls="system-plan-form" aria-expanded="false">New change</button></div>
+        <p class="error-text" id="system-run-error" role="alert" hidden></p><p class="skills-action-status" id="system-run-message" role="status"></p><p class="system-warning" id="system-editor-lock" role="status" hidden></p>
+        <div class="system-empty" id="system-runs-empty" hidden><h3>No changes yet</h3><p class="system-note">A change starts as a plan. You review its context and impact before any agent runs.</p></div>
+        <form id="system-plan-form" class="system-plan" hidden aria-labelledby="system-plan-title">
+          <h3 id="system-plan-title">New change</h3>
+          <label class="field">Task<textarea id="system-task" required maxlength="2000" rows="3" placeholder="Describe the change and the expected result"></textarea></label>
+          <fieldset class="system-plan-services"><legend>Starting services</legend><div class="system-choices" id="system-plan-services"></div><p class="system-note">Leave empty to route by capability.</p><label class="field system-depth">Contract consumers that join the plan<select id="system-depth"><option value="32" selected>Every service downstream of them</option><option value="1">Only their direct consumers</option><option value="0">None: only the starting services</option></select></label></fieldset>
+          <div class="system-plan-grid"><label class="field">Change ID<input id="system-change-id" required maxlength="80" value="change-001" pattern="[a-z0-9][a-z0-9._-]*" spellcheck="false" autocomplete="off"></label><label class="field">Changed contracts<input id="system-contracts" maxlength="2000" placeholder="Optional: order.placed or orders:order.placed, comma-separated" spellcheck="false" autocomplete="off"></label><label class="field">Context budget, characters<input id="system-budget" type="number" min="128" max="64000" value="8000" required></label></div>
+          <div class="skills-actions"><button class="button primary" id="system-prepare" type="submit">Prepare plan</button><button class="button" type="button" id="system-plan-cancel">Cancel</button></div>
+        </form>
+        <section id="system-run" class="system-run" hidden aria-labelledby="system-run-title">
+          <ol class="stepper" id="system-stepper" aria-label="Change steps"></ol>
+          <div class="system-run-head"><div><h3 id="system-run-title" tabindex="-1"></h3><p id="system-run-status" class="system-run-status" role="status"></p></div><div class="system-run-actions" id="system-run-actions"><button type="button" class="button" id="system-open-session" hidden>Open runner session</button><button type="button" class="button danger" id="system-cancel" hidden>Cancel run</button><button type="button" class="button quiet" id="system-replan" hidden title="Open a new plan filled from this change, to revise its task">Plan again</button><button type="button" class="button quiet" id="system-archive" hidden title="Hide this change from the list; its plan, receipts and native tasks are kept">Remove from list</button></div></div>
+          <dl id="system-plan-summary" class="system-facts"></dl>
+          <ol id="system-flow" class="system-flow" aria-label="Planned steps"></ol>
+          <details class="system-details"><summary>Context, impact, warnings and source fingerprints</summary><pre id="system-plan-json" class="system-json"></pre></details>
+          <div id="system-launch" class="system-launch">
+            <h4>Launch</h4>
+            <p class="system-warning" id="system-selection-note" hidden>No service matched this plan, so it cannot launch. Prepare a new change with starting services or changed contracts.</p>
+            <div class="system-launch-grid"><label class="field">Provider<select id="system-provider"></select></label><label class="field">Mode<select id="system-mode"><option value="read-only">Read-only investigation</option><option value="edit">Edit each selected service</option></select></label><label class="field">Service agents may edit<select id="system-access"><option value="all">All selected services</option><option value="service">Own service only</option></select></label><label class="field">Timeout per agent, seconds<input id="system-timeout" type="number" min="1" max="86400" value="900"></label></div>
+            <p class="system-note" id="system-provider-note">Every agent shares one context: it reads the system folder and every service of this change and receives the reviewed memory of all of them and the complete reports of the agents before it. Execution uses the selected CLI with its default model, sequential workers and native tasks. Read-only runs still create Brain task records. Edit mode writes in each service’s current checkout.</p>
+            <div class="system-confirm"><label class="checkbox"><input id="system-reviewed" type="checkbox">I reviewed the scope and context</label><button type="button" class="button primary" id="system-execute">Execute reviewed plan</button></div>
+          </div>
+          <div id="system-recovery" class="system-recovery" hidden>
+            <h4>Recover an unfinished run</h4><p class="system-note">Inspect the saved receipts and workspace before retrying. Completed dispatches are skipped. An interrupted dispatch may have made partial edits. No agent writes the system folder: to fix a shared contract or document a dispatch reported, edit it yourself, then accept the changes and retry that dispatch.</p>
+            <label class="field system-retry-field">Dispatch to retry<select id="system-retry"></select></label>
+            <p class="system-note" id="system-resume-note"></p>
+            <label class="checkbox" id="system-accept-unrun-field" hidden><input id="system-accept-unrun" type="checkbox"><span id="system-accept-unrun-text">I accept the checks verification could not run</span></label>
+            <div class="system-confirm"><label class="checkbox"><input id="system-accept-changes" type="checkbox">I inspected and accept the source changes since the last checkpoint</label><button type="button" class="button" id="system-resume">Resume saved run</button></div>
+          </div>
+          <section class="agents-section" id="system-agents-section" aria-labelledby="system-agents-title" hidden>
+            <div class="agents-toolbar"><h4 id="system-agents-title">Agents</h4><span class="agents-live" id="system-agents-live" hidden>Live</span><label class="field agents-launch" id="system-agents-launch-field" hidden>Launch<select id="system-agents-launch"></select></label></div>
+            <p class="system-note" id="system-agents-note">Select an agent to follow what it reads, runs, edits and reports. Receipts below stay authoritative.</p>
+            <div id="system-agents"></div>
+          </section>
+          <section id="system-results" class="system-results" aria-labelledby="system-receipts-title" hidden><h4 id="system-receipts-title">Dispatch receipts</h4><p class="system-note">Checks and completion are worker-reported. Inspect the evidence before delivery; execution makes no commit, merge or deployment.</p><div id="system-receipts" class="system-cards"></div><p id="system-handoff" class="system-note system-handoff"></p><details class="system-details" id="system-native-details"><summary id="system-native-summary">Native task references</summary><ul id="system-native-tasks" class="system-native-tasks"></ul></details></section>
+          <details class="system-details" id="system-events-log" hidden><summary>Runner log</summary><pre id="system-events" class="system-json"></pre></details>
+        </section>
+      </div></div></section>
+    </main>
+  </div>
+  <dialog class="folder-picker" id="folder-picker" aria-labelledby="folder-picker-title" aria-describedby="folder-picker-description">
+    <div class="folder-picker-head"><h2 id="folder-picker-title">Choose a project folder</h2><button class="button" id="folder-picker-close" type="button" aria-label="Close folder browser">Close</button></div>
+    <p class="knowledge-note" id="folder-picker-description">Browse folders on the computer running Harness. Select a folder, then add it to your projects.</p>
+    <form class="folder-picker-form" id="folder-picker-location-form"><label class="field">Folder path<input id="folder-picker-location" type="text" maxlength="1024" autocomplete="off" spellcheck="false" required></label><button class="button" type="submit">Go</button></form>
+    <div class="folder-picker-actions"><button class="button" id="folder-picker-home" type="button">Home</button><button class="button" id="folder-picker-parent" type="button" disabled>Parent folder</button><label class="checkbox"><input id="folder-picker-hidden" type="checkbox"> Show hidden folders</label></div>
+    <form class="folder-picker-form" id="folder-picker-search-form"><label class="field">Find a folder in this location<input id="folder-picker-query" type="text" maxlength="100" placeholder="Search by folder name…" autocomplete="off"></label><button class="button" id="folder-picker-search" type="submit">Search</button><button class="button" id="folder-picker-clear" type="button">Clear</button></form>
+    <p class="knowledge-note" id="folder-picker-current"></p><p class="error-text" id="folder-picker-error" role="alert" hidden></p><p class="knowledge-note" id="folder-picker-status" role="status"></p>
+    <div class="folder-picker-list" id="folder-picker-list" aria-label="Folders" aria-busy="false"></div>
+    <div class="folder-picker-actions"><span class="knowledge-note">Open a folder to select it.</span><button class="button primary" id="folder-picker-use" type="button" disabled>Use this folder</button></div>
+  </dialog>
+  <dialog class="folder-picker" id="task-context-picker" aria-labelledby="task-context-title" aria-describedby="task-context-description">
+    <h2 id="task-context-title">Add context from another task</h2>
+    <p class="knowledge-note" id="task-context-description">The draft holds where the task ran, its first and latest requests, its latest reply and, while there is room, earlier turns. Edit it before attaching.</p>
+    <label class="field">Source task<select id="task-context-source" disabled></select></label>
+    <label class="field">Context to attach<textarea id="task-context-draft" rows="9" maxlength="6000" disabled></textarea></label>
+    <p class="knowledge-note" id="task-context-status" role="status"></p>
+    <p class="error-text" id="task-context-error" role="alert" hidden></p>
+    <div class="folder-picker-actions"><button class="button" type="button" id="task-context-cancel">Cancel</button><button class="button primary" type="button" id="task-context-attach" disabled>Attach context</button></div>
+  </dialog>
+  <dialog class="folder-picker" id="merge-picker" aria-labelledby="merge-picker-title" aria-describedby="merge-picker-description">
+    <h2 id="merge-picker-title">Merge chats into a new task</h2>
+    <p class="knowledge-note" id="merge-picker-description">Choose 2–8 finished chats from this project. The new task starts with a saved copy of their messages, each kept with its chat; the chats themselves stay as they are.</p>
+    <fieldset class="merge-list" id="merge-options"><legend class="sr-only">Chats to merge</legend></fieldset>
+    <p class="knowledge-note" id="merge-selection-count" role="status">No chats selected</p>
+    <div class="folder-picker-actions"><button class="button" type="button" id="merge-picker-cancel">Cancel</button><button class="button primary" type="button" id="merge-picker-continue" disabled>Continue with selected chats</button></div>
+  </dialog>
+  <div class="run-file-card" id="run-file-card" role="dialog" aria-label="File details" hidden></div>
+  <script type="module" src="/boot.js"></script>
+</body>
+</html>

@@ -1,0 +1,24 @@
+[package]
+name = "orch-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "orch-engine"
+path = "src/main.rs"
+
+[dependencies]
+orch-core = { path = "../orch-core" }
+orch-host = { path = "../orch-host" }
+orch-system = { path = "../orch-system" }
+orch-harness = { path = "../orch-harness" }
+serde = { version = "=1.0.228", features = ["derive"] }
+serde_json = { version = "=1.0.150", features = ["preserve_order", "arbitrary_precision"] }
+tokio = { version = "=1.54.1", features = ["rt-multi-thread", "macros", "io-util", "sync", "time"] }
+chrono = "=0.4.45"
+
+[dev-dependencies]
+tempfile = "3"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }

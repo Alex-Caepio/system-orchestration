@@ -1,0 +1,40 @@
+{
+  "description": "System Orchestration lifecycle hooks for subagent write-lock gating and dispatch completion relays.",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/orch-engine\" hook subagent-gate --host claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Agent|Task",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/orch-engine\" hook subagent-dispatch --host claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/orch-engine\" hook subagent-dispatch --host claude",
+            "timeout": 10
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "name": "system-orchestration",
+  "version": "0.1.0",
+  "description": "Standalone multi-service system orchestration, session scheduler, fleet review, clash debate, SQLite working memory, and WASM workbench.",
+  "author": {
+    "name": "Alex-Caepio"
+  },
+  "repository": "https://github.com/Alex-Caepio/system-orchestration",
+  "homepage": "https://github.com/Alex-Caepio/system-orchestration",
+  "license": "MIT",
+  "keywords": [
+    "orchestration",
+    "multi-service",
+    "sessions",
+    "fleet-review",
+    "clash",
+    "working-memory"
+  ]
+}

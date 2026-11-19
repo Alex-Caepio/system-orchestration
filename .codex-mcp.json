@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "system-orchestration": {
+      "command": "./bin/orch-engine",
+      "args": ["mcp"],
+      "cwd": ".",
+      "tool_timeout_sec": 900
+    }
+  }
+}
