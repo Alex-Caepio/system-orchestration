@@ -764,15 +764,18 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
         .unwrap();
     assert_eq!(strict_catalog.status(), 404);
 
-    // Verify HTML fixes (DOM nesting inside <main>, theme IDs, collapsed #model-hint) and CSS select fixes.
+    // Verify HTML fixes (DOM nesting inside <main>, closed single #panel-project, theme IDs, collapsed #model-hint) and CSS select fixes.
     let html = client.get(format!("{base}/")).send().await.unwrap().text().await.unwrap();
     assert!(html.contains(r#"id="theme-dark""#));
     assert!(html.contains(r#"id="model-hint" data-visible="false""#));
+    assert_eq!(html.matches(r#"id="panel-project""#).count(), 1, "duplicate #panel-project in HTML");
     let main_start = html.find(r#"<main class="main" id="main""#).unwrap();
     let main_end = html.rfind("</main>").unwrap();
     let main_slice = &html[main_start..main_end];
     for inside_main in [
         r#"id="composer-area""#,
+        r#"id="workspace-resizer""#,
+        r#"id="sessions-right-pane""#,
         r#"id="results-view""#,
         r#"id="systems-view""#,
         r#"id="system-changes-view""#,
@@ -790,6 +793,12 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
         .unwrap();
     assert_eq!(&wasm_bytes[..4], b"\0asm");
 
+    let graph_http = client
+        .get(format!("{base}/api/projects/{project_id}/graph?check=1"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(graph_http.status(), 200, "graph status should be registered (not 503)");
     let perms_wait = client
         .get(format!("{base}/api/permissions/waiting"))
         .send()
@@ -824,6 +833,7 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
     drop(sse);
     let css = client.get(format!("{base}/app.css")).send().await.unwrap().text().await.unwrap();
     assert!(css.contains("-webkit-appearance:none"));
+    assert!(css.contains(".field:has(#workflow)"));
     assert!(css.contains("text-overflow:ellipsis"));
     assert!(css.contains("white-space:nowrap"));
 

@@ -249,6 +249,7 @@ impl ServicesFactory for NativeFactory {
             domains.insert("commands".into(), commands);
             domains.insert("providers".into(), providers.clone());
             domains.insert("working_memory".into(), working_memory);
+            domains.insert("graph".into(), graphs.clone());
             domains.insert("system_graph".into(), system_graphs);
             domains.insert("omnigraph".into(), omnigraph_domain);
             let initial_omnigraph =
