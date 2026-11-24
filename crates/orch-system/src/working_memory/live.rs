@@ -85,24 +85,6 @@ impl LiveContext {
         Ok(())
     }
 }
-/// A pilot failure's fixed code (`working_memory_root_changed`). Any other
-/// cause (I/O, decoding) has no code, so no annotation, path or receipt text
-/// reaches a diagnostic.
-fn code(error: &anyhow::Error) -> Option<String> {
-    let message = error.to_string();
-    (message.len() <= 64
-        && message.starts_with(|c: char| c.is_ascii_lowercase())
-        && message
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_'))
-    .then_some(message)
-}
-fn unavailable(what: &str, error: &anyhow::Error) -> orch_core::RuntimeError {
-    common::fail(match code(error) {
-        Some(code) => format!("Working-memory experiment {what} unavailable ({code})"),
-        None => format!("Working-memory experiment {what} unavailable"),
-    })
-}
 impl DispatchContext for LiveContext {
     fn prompt(
         &mut self,
@@ -112,43 +94,24 @@ impl DispatchContext for LiveContext {
         prior: &[Value],
         scratch: Option<&Path>,
     ) -> orch_core::Result<String> {
-        // Replaying completed receipts closes the finish/import crash window.
-        self.reconcile(state)
-            .map_err(|error| unavailable("trace", &error))?;
-        // Only the treatment delivers the view. The control arm records the
-        // view it withholds, or the code that prevented it, and never fails on it.
-        let (read, view_error) = match self.memory.snapshot(state) {
-            Ok(read) => (Some(read), None),
-            Err(error) if self.deliver_view => return Err(unavailable("view", &error)),
-            Err(error) => (
-                None,
-                Some(code(&error).unwrap_or_else(|| "unavailable".into())),
-            ),
-        };
-        let view = read
-            .as_ref()
-            .filter(|_| self.deliver_view)
-            .map(|read| &read.snapshot);
-        // The native builder's own refusals (prompt budget, snapshot
-        // validation) carry no worker data and keep their native wording.
-        let prompt = native::prompt_for_working_memory_experiment(
-            state,
-            plan,
-            step,
-            prior,
-            scratch,
-            view,
-            PRODUCER_INSTRUCTION,
-        )?;
-        let snapshot_sha256 = read
-            .as_ref()
-            .map(|read| hash(&read.snapshot))
-            .transpose()
-            .map_err(|error| unavailable("trace", &error))?;
-        self.deliveries.push(json!({"dispatch_id":step["dispatch_id"],"phase":step["id"],"view_enabled":self.deliver_view,"entries":view.and_then(|snapshot| snapshot["entries"].as_array()).map_or(0, Vec::len),"snapshot_sha256":snapshot_sha256,"backend":read.as_ref().map(|read| read.backend),"view_error":view_error,"input_sha256":strict::sha(prompt.as_bytes()),"prompt_bytes":prompt.len()}));
-        self.save_trace()
-            .map_err(|error| unavailable("trace", &error))?;
-        Ok(prompt)
+        let result = (|| -> Result<String> {
+            // Replaying completed receipts closes the finish/import crash window.
+            self.reconcile(state)?;
+            let read = self.memory.snapshot(state)?;
+            let prompt = native::prompt_for_working_memory_experiment(
+                state,
+                plan,
+                step,
+                prior,
+                scratch,
+                self.deliver_view.then_some(&read.snapshot),
+                PRODUCER_INSTRUCTION,
+            )?;
+            self.deliveries.push(json!({"dispatch_id":step["dispatch_id"],"phase":step["id"],"view_enabled":self.deliver_view,"entries":if self.deliver_view { read.snapshot["entries"].as_array().map_or(0, Vec::len) } else { 0 },"snapshot_sha256":hash(&read.snapshot)?,"backend":read.backend,"input_sha256":strict::sha(prompt.as_bytes()),"prompt_bytes":prompt.len()}));
+            self.save_trace()?;
+            Ok(prompt)
+        })();
+        result.map_err(|_| common::fail("Working-memory experiment prompt unavailable"))
     }
     fn completed(
         &mut self,
@@ -157,7 +120,7 @@ impl DispatchContext for LiveContext {
         _receipt: &Value,
     ) -> orch_core::Result<()> {
         self.reconcile(state)
-            .map_err(|error| unavailable("trace", &error))
+            .map_err(|_| common::fail("Working-memory experiment trace unavailable"))
     }
 }
 

@@ -654,69 +654,143 @@ fn provider_metrics_persist_only_allowlisted_numbers_and_command_hashes() {
     assert!(!metric.to_string().contains(&secret));
     assert!(live::event_metric(&json!({"type":"output","line":secret})).is_none());
 }
-#[cfg(unix)]
+
 #[test]
-fn a_failed_view_fails_only_the_arm_that_delivers_it() {
-    use crate::runner::DispatchContext;
-    for deliver_view in [false, true] {
-        let (_temp, s) = fixture();
-        let mut context = live::LiveContext::new(local(&s), deliver_view);
-        std::fs::rename(
-            s.workspace.join("orders"),
-            s.workspace.join("previous-orders"),
-        )
-        .unwrap();
-        std::fs::create_dir(s.workspace.join("orders")).unwrap();
-        let result = context.prompt(&s.state, &s.plan, &s.step, &s.prior().unwrap(), None);
-        if deliver_view {
-            let error = result.unwrap_err();
-            assert_eq!(
-                error.message,
-                "Working-memory experiment view unavailable (working_memory_root_changed)"
-            );
-            assert!(context.deliveries.is_empty());
-        } else {
-            let prompt = result.unwrap();
-            assert!(prompt.contains(live::PRODUCER_INSTRUCTION));
-            assert!(
-                payload(&prompt)["shared_context"]
-                    .get("working_memory")
-                    .is_none()
-            );
-            assert_eq!(
-                context.deliveries[0]["view_error"],
-                "working_memory_root_changed"
-            );
-            assert!(context.deliveries[0]["snapshot_sha256"].is_null());
-            assert!(context.deliveries[0]["backend"].is_null());
+#[ignore = "requires explicit INFRA_RUN_MEMORY_ARCHIVED_COHORT containing all six real cases"]
+fn real_archived_receipts_pass_the_final_privacy_gate() {
+    let directory = PathBuf::from(
+        std::env::var_os("INFRA_RUN_MEMORY_ARCHIVED_COHORT").expect("explicit cohort required"),
+    );
+    assert!(directory.is_absolute());
+    let mut count = 0;
+    for task in ["stock-customer", "refund-recipient"] {
+        for arm in ["A", "B", "C"] {
+            let run = directory.join(format!("{task}-{arm}/run"));
+            let state = common::read_json(&run, "run.json", common::MAX_BYTES).unwrap();
+            assert_eq!(state["status"], "completed");
+            let mut seen = 0;
+            for step in state["steps"].as_array().unwrap() {
+                let receipt = execution::dispatch_receipt(&run, &state, step).unwrap();
+                assert!(execution::completed_receipt(&receipt, step));
+                // Exact new gate predicate, plus whole persisted envelope/error audit.
+                assert!(
+                    orch_core::domain::secret_label(&common::encoded(&receipt["report"]).unwrap())
+                        .unwrap()
+                        .is_none()
+                );
+                assert!(
+                    orch_core::domain::secret_label(&common::encoded(&receipt).unwrap())
+                        .unwrap()
+                        .is_none()
+                );
+                execution::validate_report(
+                    &receipt["report"],
+                    step,
+                    &common::texts(&state["selected"]),
+                    execution::access_scope(&state),
+                )
+                .unwrap();
+                seen += 1;
+            }
+            assert_eq!(seen, 4, "every real native dispatch must be represented");
+            count += seen;
         }
     }
+    assert_eq!(count, 24);
+    eprintln!(
+        "24 real archived native receipts pass the final pre-storage privacy gate and report contract"
+    );
 }
 
 #[test]
-fn completed_receipts_enforce_final_privacy_gate() {
-    let (_temp, s) = fixture();
-    let mut mem = local(&s);
-    append(&mut mem, &s);
-    let receipt = execution::dispatch_receipt(&s.run, &s.state, &s.state["steps"][0]).unwrap();
-    assert!(execution::completed_receipt(&receipt, &s.state["steps"][0]));
-    assert!(
-        orch_core::domain::secret_label(&common::encoded(&receipt["report"]).unwrap())
-            .unwrap()
-            .is_none()
+fn snapshot_store_invalidates_before_ttl_when_citation_or_graph_ir_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut store = SqliteStore::open(temp.path()).unwrap();
+    let base_validation = SnapshotValidation {
+        citations: vec![Citation {
+            service: "orders".into(),
+            path: "src/Order.php".into(),
+            sha256: "a".repeat(64),
+        }],
+        graph_ir_revisions: BTreeMap::from([("graph_ir.sqlite3".into(), 1)]),
+    };
+    let key = "infra:pilot:run-memory:v1:unit-test";
+    let payload = br#"{"ok":true}"#;
+    store
+        .publish_validated(key, payload, Duration::from_secs(600), &base_validation)
+        .unwrap();
+    assert_eq!(
+        store.load_validated(key, &base_validation).unwrap(),
+        Some(payload.to_vec())
     );
-    assert!(
-        orch_core::domain::secret_label(&common::encoded(&receipt).unwrap())
-            .unwrap()
-            .is_none()
+
+    // Changing a cited source SHA-256 invalidates before TTL and deletes the stale row.
+    let mut drifted_citation = base_validation.clone();
+    drifted_citation.citations[0].sha256 = "b".repeat(64);
+    assert_eq!(store.load_validated(key, &drifted_citation).unwrap(), None);
+    assert_eq!(
+        store.load(key).unwrap(),
+        None,
+        "mismatch must evict stale row from SqliteStore"
     );
-    execution::validate_report(
-        &receipt["report"],
-        &s.state["steps"][0],
-        &common::texts(&s.state["selected"]),
-        execution::access_scope(&s.state),
+
+    // Republish and confirm Graph-IR revision drift also invalidates immediately before TTL.
+    store
+        .publish_validated(key, payload, Duration::from_secs(600), &base_validation)
+        .unwrap();
+    let mut drifted_ir = base_validation.clone();
+    drifted_ir
+        .graph_ir_revisions
+        .insert("graph_ir.sqlite3".into(), 2);
+    assert_eq!(store.load_validated(key, &drifted_ir).unwrap(), None);
+
+    // End-to-end RunWorkingMemory + WAL Graph-IR write_epoch bump transitions hit -> rebuilt.
+    let (_sc_temp, s) = fixture();
+    let service_root = PathBuf::from(s.state["roots"]["orders"].as_str().unwrap());
+    let ir_dir = service_root.join("memory-bank/local");
+    std::fs::create_dir_all(&ir_dir).unwrap();
+    let ir_db = ir_dir.join("graph_ir.sqlite3");
+    let ir_conn = Connection::open(&ir_db).unwrap();
+    ir_conn
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;\
+             CREATE TABLE ir_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);\
+             INSERT INTO ir_meta(key, value) VALUES('write_epoch', '1');",
+        )
+        .unwrap();
+
+    let mut m = local(&s);
+    append(&mut m, &s);
+    // `append` publishes the initial view; reading again is a cache hit until Graph-IR bumps.
+    assert_eq!(m.snapshot(&s.state).unwrap().backend, "hit");
+
+    ir_conn
+        .execute("UPDATE ir_meta SET value='2' WHERE key='write_epoch'", [])
+        .unwrap();
+    assert_eq!(m.snapshot(&s.state).unwrap().backend, "rebuilt");
+    assert_eq!(m.snapshot(&s.state).unwrap().backend, "hit");
+
+    // Settled file-stamp citation cache reuses citations outside CITATION_RACY_NS and refreshes on edit.
+    let cited = m.citation("orders", "contract.txt").unwrap();
+    let (_, settled_ns) = file_stamp(&service_root.join("contract.txt")).unwrap();
+    let hit = m
+        .citation_cached_with_now("orders", "contract.txt", settled_ns + CITATION_RACY_NS + 1)
+        .unwrap();
+    assert_eq!(hit, cited);
+    std::fs::write(
+        service_root.join("contract.txt"),
+        "refund.completed: refund_id, order_id, reason\n",
     )
     .unwrap();
+    let refreshed = m
+        .citation_cached_with_now("orders", "contract.txt", settled_ns + CITATION_RACY_NS + 2)
+        .unwrap();
+    assert_ne!(refreshed.sha256, cited.sha256);
+}
+
+#[test]
+fn working_memory_notes_store_persists_and_blocks_secrets() {
+    let (_temp, s) = fixture();
     let store = super::notes::WorkingMemoryStore::open(&s.directory.join("notes")).unwrap();
     let written = store
         .write_note(

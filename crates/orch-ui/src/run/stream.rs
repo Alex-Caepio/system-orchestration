@@ -1,0 +1,3261 @@
+use super::*;
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::rc::Rc;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct StreamMdEntry {
+    settled_bytes: usize,
+    settled_dom_blocks: usize,
+    tail_blocks: Vec<String>,
+}
+
+const TOOL_OUTPUT_PREVIEW_CHARS: usize = 8_000;
+const TOOL_OUTPUT_MAX_STORED_CHARS: usize = 512_000;
+
+thread_local! {
+    static NEXT_COPY_SEQ: Cell<u64> = const { Cell::new(1) };
+    static NEXT_STREAM_SEQ: Cell<u64> = const { Cell::new(1) };
+    static STREAM_MD_CACHE: RefCell<BTreeMap<String, StreamMdEntry>> = const { RefCell::new(BTreeMap::new()) };
+    static STREAM_RAW_TEXT: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
+    static CALL_BLOCK_CACHE: RefCell<BTreeMap<String, web_sys::Element>> = const { RefCell::new(BTreeMap::new()) };
+    static TOOL_FULL_OUTPUTS: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
+    static TOOL_OUTPUT_ORDER: RefCell<VecDeque<String>> = const { RefCell::new(VecDeque::new()) };
+    static RENDERED_EVENT_IDS: RefCell<BTreeSet<u64>> = const { RefCell::new(BTreeSet::new()) };
+    static LAST_MAX_RENDERED_ID: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+const TOOL_OUTPUT_MAX_CACHED_KEYS: usize = 256;
+const TOOL_OUTPUT_MAX_TOTAL_BYTES: usize = 16 * 1024 * 1024;
+const LIVE_STICKY_DOM_BLOCK_CAP: usize = 200;
+const SCROLLED_UP_DOM_BLOCK_CAP: usize = 1_200;
+const STATE_EVENTS_HARD_CAP: usize = SCROLLED_UP_DOM_BLOCK_CAP;
+const FOLD_CHECKPOINT_STRIDE: usize = 64;
+const MAX_FOLD_CHECKPOINTS: usize = 16;
+
+#[derive(Clone, Debug)]
+struct RunCallEntry {
+    tool: String,
+    key: String,
+    path: V,
+    detail: V,
+    event_id: V,
+    started: V,
+    open: bool,
+    ok: bool,
+    settled: bool,
+    touched: BTreeMap<String, &'static str>,
+}
+
+impl RunCallEntry {
+    fn to_value(&self) -> V {
+        let mut obj = serde_json::Map::new();
+        obj.insert("tool".into(), V::String(self.tool.clone()));
+        obj.insert("key".into(), V::String(self.key.clone()));
+        obj.insert("path".into(), self.path.clone());
+        obj.insert("detail".into(), self.detail.clone());
+        obj.insert("event_id".into(), self.event_id.clone());
+        obj.insert("started".into(), self.started.clone());
+        obj.insert("open".into(), V::Bool(self.open));
+        obj.insert("ok".into(), V::Bool(self.ok));
+        if !self.touched.is_empty() {
+            let mut touched_map = serde_json::Map::new();
+            for (k, v) in &self.touched {
+                touched_map.insert(k.clone(), V::String((*v).to_owned()));
+            }
+            obj.insert("touched".into(), V::Object(touched_map));
+        }
+        if self.settled {
+            obj.insert("settled".into(), V::Bool(true));
+        }
+        V::Object(obj)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct RunFileEntry {
+    path: String,
+    reads: u64,
+    edits: u64,
+    outside: bool,
+    order: usize,
+    first_step: V,
+    last_step: V,
+    event_id: V,
+    main: bool,
+    helper: bool,
+    created: bool,
+    deleted: bool,
+    failed: bool,
+}
+
+impl RunFileEntry {
+    fn to_value(&self) -> V {
+        let mut obj = serde_json::Map::new();
+        obj.insert("path".into(), V::String(self.path.clone()));
+        obj.insert("reads".into(), json!(self.reads));
+        obj.insert("edits".into(), json!(self.edits));
+        obj.insert("outside".into(), V::Bool(self.outside));
+        obj.insert("order".into(), json!(self.order));
+        obj.insert("first_step".into(), self.first_step.clone());
+        obj.insert("last_step".into(), self.last_step.clone());
+        obj.insert("event_id".into(), self.event_id.clone());
+        if self.main {
+            obj.insert("main".into(), V::Bool(true));
+        }
+        if self.helper {
+            obj.insert("helper".into(), V::Bool(true));
+        }
+        if self.created {
+            obj.insert("created".into(), V::Bool(true));
+        }
+        if self.deleted {
+            obj.insert("deleted".into(), V::Bool(true));
+        }
+        if self.failed {
+            obj.insert("failed".into(), V::Bool(true));
+        }
+        V::Object(obj)
+    }
+}
+
+/// Structural-sharing fold state for `run` events (`Rc` entries prevent cloning whole maps per event/checkpoint).
+#[derive(Clone, Debug, Default)]
+pub(crate) struct RunState {
+    active: bool,
+    launch: String,
+    started: V,
+    check: bool,
+    steps: u64,
+    messages: u64,
+    finished: bool,
+    outcome: Option<String>,
+    kinds: Vec<String>,
+    calls: BTreeMap<String, Rc<RunCallEntry>>,
+    uncalled: BTreeMap<String, VecDeque<String>>,
+    files: BTreeMap<String, Rc<RunFileEntry>>,
+    commands: Vec<Rc<V>>,
+    command_idx_by_call: BTreeMap<String, usize>,
+    plan: V,
+    searches: Vec<Rc<V>>,
+    skillcache: Vec<Rc<V>>,
+    usage: Option<Rc<V>>,
+    memory: Option<Rc<V>>,
+    omnigraph: Option<Rc<V>>,
+    delegation: Option<Rc<V>>,
+    error: Option<Rc<V>>,
+    result: Option<Rc<V>>,
+}
+
+impl RunState {
+    fn reset_launch(&mut self, launch: String, started: V) {
+        self.active = true;
+        self.launch = launch;
+        self.started = started;
+        self.check = false;
+        self.steps = 0;
+        self.messages = 0;
+        self.finished = false;
+        self.outcome = None;
+        self.kinds.clear();
+        self.calls.clear();
+        self.uncalled.clear();
+        self.files.clear();
+        self.commands.clear();
+        self.command_idx_by_call.clear();
+        self.plan = V::Array(Vec::new());
+        self.searches.clear();
+        self.skillcache.clear();
+        self.usage = None;
+        self.memory = None;
+        self.omnigraph = None;
+        self.delegation = None;
+        self.error = None;
+        self.result = None;
+    }
+
+    fn is_check(&self) -> bool {
+        self.check
+            && !self.kinds.iter().any(|kind| {
+                matches!(
+                    kind.as_str(),
+                    "session" | "text" | "tool" | "plan" | "usage" | "result"
+                )
+            })
+    }
+
+    fn pair_anonymous(&mut self, key: &str, start: bool, event_id: &str) -> String {
+        let queue = self.uncalled.entry(key.to_owned()).or_default();
+        let call = if start || queue.is_empty() {
+            format!("anonymous-{event_id}")
+        } else {
+            queue.pop_front().unwrap_or_default()
+        };
+        if start {
+            queue.push_back(call.clone());
+        }
+        call
+    }
+
+    fn apply_event(&mut self, event: &V) -> (Option<Rc<V>>, Option<String>) {
+        let launch = m::text(event, "launch_id");
+        let mut replaced = None;
+        let mut resolved_call = None;
+        if !self.active || (!launch.is_empty() && self.launch != launch) {
+            if self.active && !self.is_check() {
+                replaced = Some(Rc::new(self.to_value()));
+            }
+            self.reset_launch(launch, event["at"].clone());
+        }
+        let kind = m::text(event, "kind");
+        if !self.kinds.iter().any(|k| k == &kind) {
+            self.kinds.push(kind.clone());
+        }
+        match kind.as_str() {
+            "tool" => {
+                let name = tool_name(event);
+                let key = name.to_lowercase();
+                let start = starts(event);
+                let call = match event["call_id"]
+                    .as_str()
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| {
+                        event["call"]
+                            .as_str()
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                    }) {
+                    Some(call) => call.to_owned(),
+                    None => self.pair_anonymous(&key, start, &m::string(&event["id"])),
+                };
+                resolved_call = Some(call.clone());
+                let target = event["path"]
+                    .as_str()
+                    .or_else(|| event["detail"].as_str())
+                    .unwrap_or("");
+                let mut item_rc = self.calls.remove(&call).unwrap_or_else(|| {
+                    Rc::new(RunCallEntry {
+                        tool: name.clone(),
+                        key: key.clone(),
+                        path: event["path"].clone(),
+                        detail: event["detail"].clone(),
+                        event_id: event["id"].clone(),
+                        started: event["at"].clone(),
+                        open: start,
+                        ok: true,
+                        settled: false,
+                        touched: BTreeMap::new(),
+                    })
+                });
+                let ok_val = event["ok"]
+                    .as_bool()
+                    .unwrap_or(!m::text(event, "text").contains("failed"));
+                {
+                    let item = Rc::make_mut(&mut item_rc);
+                    item.open = start;
+                    item.ok = ok_val;
+                    item.event_id = event["id"].clone();
+                    if start {
+                        self.steps += 1;
+                    }
+                    let touched_names = named(&key, target, event);
+                    if !touched_names.is_empty() {
+                        let step_val = json!(self.steps);
+                        let by_helper = event["parent"].as_str().is_some_and(|id| !id.is_empty());
+                        for (path, how, outside) in touched_names {
+                            if item.touched.contains_key(&path) {
+                                continue;
+                            }
+                            item.touched.insert(path.clone(), how);
+                            let next_order = self.files.len();
+                            let file_rc = self.files.entry(path.clone()).or_insert_with(|| {
+                                Rc::new(RunFileEntry {
+                                    path,
+                                    reads: 0,
+                                    edits: 0,
+                                    outside,
+                                    order: next_order,
+                                    first_step: step_val.clone(),
+                                    last_step: step_val.clone(),
+                                    event_id: event["id"].clone(),
+                                    main: false,
+                                    helper: false,
+                                    created: false,
+                                    deleted: false,
+                                    failed: false,
+                                })
+                            });
+                            let file = Rc::make_mut(file_rc);
+                            if how == "read" {
+                                file.reads += 1;
+                            }
+                            if by_helper {
+                                file.helper = true;
+                            } else {
+                                file.main = true;
+                            }
+                            file.last_step = step_val.clone();
+                            file.event_id = event["id"].clone();
+                        }
+                    }
+                    if !start && !item.settled {
+                        item.settled = true;
+                        let item_ok = item.ok;
+                        for (path, how) in &item.touched {
+                            let Some(file_rc) = self.files.get_mut(path) else {
+                                continue;
+                            };
+                            let file = Rc::make_mut(file_rc);
+                            if !item_ok {
+                                if event["outcome"] != "not_run" {
+                                    file.failed = true;
+                                }
+                                continue;
+                            }
+                            match *how {
+                                "read" => continue,
+                                "add" => file.created = true,
+                                "delete" => file.deleted = true,
+                                _ => {}
+                            }
+                            file.edits += 1;
+                            file.event_id = event["id"].clone();
+                        }
+                    }
+                }
+                self.calls.insert(call.clone(), item_rc);
+                if ["grep", "glob", "ls"].contains(&key.as_str()) && start {
+                    self.searches.push(Rc::new(
+                        json!({"pattern":event["detail"],"scope":event["path"],"event_id":event["id"]}),
+                    ));
+                }
+                if ["bash", "shell"].contains(&key.as_str()) {
+                    if let Some(&cmd_idx) = self.command_idx_by_call.get(&call) {
+                        if let Some(cmd_rc) = self.commands.get_mut(cmd_idx) {
+                            let cmd = Rc::make_mut(cmd_rc);
+                            cmd["running"] = json!(start);
+                            cmd["ok"] = json!(ok_val);
+                            cmd["event_id"] = event["id"].clone();
+                        }
+                    } else {
+                        let command = event["detail"].as_str().unwrap_or_else(|| {
+                            event["text"]
+                                .as_str()
+                                .unwrap_or("")
+                                .split_once(": ")
+                                .map(|(_, s)| s)
+                                .unwrap_or("")
+                        });
+                        let idx = self.commands.len();
+                        self.commands.push(Rc::new(json!({
+                            "call": call,
+                            "command": command,
+                            "class": classify(command),
+                            "running": start,
+                            "ok": ok_val,
+                            "event_id": event["id"],
+                            "at": event["at"],
+                        })));
+                        self.command_idx_by_call.insert(call, idx);
+                    }
+                }
+            }
+            "plan" => {
+                self.plan = event["items"]
+                    .as_array()
+                    .or_else(|| event["plan"].as_array())
+                    .cloned()
+                    .map(V::Array)
+                    .unwrap_or_else(|| event["plan"].clone());
+            }
+            "text" => self.messages += 1,
+            "usage" => self.usage = Some(Rc::new(event.clone())),
+            "memory" => self.memory = Some(Rc::new(event.clone())),
+            "omnigraph" => self.omnigraph = Some(Rc::new(event.clone())),
+            "skillcache" => self.skillcache.push(Rc::new(event.clone())),
+            "delegation" => self.delegation = Some(Rc::new(event.clone())),
+            "status" => {
+                if check_status(&m::text(event, "text")) {
+                    self.check = true;
+                }
+                let status = event["status"]
+                    .as_str()
+                    .unwrap_or_else(|| event["text"].as_str().unwrap_or(""));
+                if ["completed", "failed", "cancelled", "interrupted"].contains(&status) {
+                    self.finished = true;
+                    self.outcome = Some(status.to_owned());
+                }
+            }
+            "error" => {
+                self.error = Some(Rc::new(event.clone()));
+                if m::text(event, "text").starts_with("Run failed (") {
+                    self.finished = true;
+                    self.outcome = Some("failed".into());
+                }
+            }
+            "result" => self.result = Some(Rc::new(event.clone())),
+            _ => {}
+        }
+        (replaced, resolved_call)
+    }
+
+    fn to_value(&self) -> V {
+        if !self.active {
+            return V::Null;
+        }
+        let mut obj = serde_json::Map::new();
+        obj.insert("launch".into(), V::String(self.launch.clone()));
+        let mut calls_map = serde_json::Map::new();
+        for (k, v) in &self.calls {
+            calls_map.insert(k.clone(), v.to_value());
+        }
+        obj.insert("calls".into(), V::Object(calls_map));
+        obj.insert("open".into(), V::Array(Vec::new()));
+        let mut files_map = serde_json::Map::new();
+        for (k, v) in &self.files {
+            files_map.insert(k.clone(), v.to_value());
+        }
+        obj.insert("files".into(), V::Object(files_map));
+        obj.insert(
+            "commands".into(),
+            V::Array(self.commands.iter().map(|c| c.as_ref().clone()).collect()),
+        );
+        obj.insert("plan".into(), self.plan.clone());
+        obj.insert(
+            "searches".into(),
+            V::Array(self.searches.iter().map(|s| s.as_ref().clone()).collect()),
+        );
+        obj.insert("steps".into(), json!(self.steps));
+        obj.insert("messages".into(), json!(self.messages));
+        obj.insert("finished".into(), V::Bool(self.finished));
+        obj.insert(
+            "outcome".into(),
+            self.outcome
+                .as_ref()
+                .map_or(V::Null, |s| V::String(s.clone())),
+        );
+        obj.insert(
+            "memory".into(),
+            self.memory.as_ref().map_or(V::Null, |v| v.as_ref().clone()),
+        );
+        obj.insert(
+            "omnigraph".into(),
+            self.omnigraph
+                .as_ref()
+                .map_or(V::Null, |v| v.as_ref().clone()),
+        );
+        obj.insert(
+            "skillcache".into(),
+            V::Array(self.skillcache.iter().map(|s| s.as_ref().clone()).collect()),
+        );
+        obj.insert(
+            "kinds".into(),
+            V::Array(self.kinds.iter().cloned().map(V::String).collect()),
+        );
+        obj.insert("started".into(), self.started.clone());
+        if !self.uncalled.is_empty() {
+            let mut uncalled_map = serde_json::Map::new();
+            for (k, q) in &self.uncalled {
+                uncalled_map.insert(
+                    k.clone(),
+                    V::Array(q.iter().cloned().map(V::String).collect()),
+                );
+            }
+            obj.insert("uncalled".into(), V::Object(uncalled_map));
+        }
+        if self.check {
+            obj.insert("check".into(), V::Bool(true));
+        }
+        if let Some(usage) = &self.usage {
+            obj.insert("usage".into(), usage.as_ref().clone());
+        }
+        if let Some(delegation) = &self.delegation {
+            obj.insert("delegation".into(), delegation.as_ref().clone());
+        }
+        if let Some(error) = &self.error {
+            obj.insert("error".into(), error.as_ref().clone());
+        }
+        if let Some(result) = &self.result {
+            obj.insert("result".into(), result.as_ref().clone());
+        }
+        V::Object(obj)
+    }
+}
+
+fn fnv1a_fold_feed(h1: &mut u64, h2: &mut u64, bytes: &[u8]) {
+    for &b in bytes {
+        *h1 ^= u64::from(b);
+        *h1 = h1.wrapping_mul(0x0000_0100_0000_01B3);
+        *h2 = h2.wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            ^ u64::from(b).wrapping_add(0x517C_C1B7_2722_0A95);
+    }
+}
+
+fn feed_fold_value(h1: &mut u64, h2: &mut u64, v: &V) {
+    match v {
+        V::Null => fnv1a_fold_feed(h1, h2, b"N"),
+        V::Bool(true) => fnv1a_fold_feed(h1, h2, b"T"),
+        V::Bool(false) => fnv1a_fold_feed(h1, h2, b"F"),
+        V::Number(n) => {
+            fnv1a_fold_feed(h1, h2, b"#");
+            fnv1a_fold_feed(h1, h2, n.to_string().as_bytes());
+            fnv1a_fold_feed(h1, h2, b"\0");
+        }
+        V::String(s) => {
+            fnv1a_fold_feed(h1, h2, b"$");
+            fnv1a_fold_feed(h1, h2, &s.len().to_le_bytes());
+            fnv1a_fold_feed(h1, h2, s.as_bytes());
+        }
+        V::Array(arr) => {
+            fnv1a_fold_feed(h1, h2, b"[");
+            fnv1a_fold_feed(h1, h2, &arr.len().to_le_bytes());
+            for item in arr {
+                feed_fold_value(h1, h2, item);
+            }
+            fnv1a_fold_feed(h1, h2, b"]");
+        }
+        V::Object(map) => {
+            fnv1a_fold_feed(h1, h2, b"{");
+            fnv1a_fold_feed(h1, h2, &map.len().to_le_bytes());
+            for (k, val) in map {
+                fnv1a_fold_feed(h1, h2, &k.len().to_le_bytes());
+                fnv1a_fold_feed(h1, h2, k.as_bytes());
+                feed_fold_value(h1, h2, val);
+            }
+            fnv1a_fold_feed(h1, h2, b"}");
+        }
+    }
+}
+
+fn event_fold_sig(v: &V) -> [u64; 2] {
+    let mut h1: u64 = 0xCBF2_9CE4_8422_2325;
+    let mut h2: u64 = 0x517C_C1B7_2722_0A95;
+    feed_fold_value(&mut h1, &mut h2, v);
+    [h1, h2]
+}
+
+#[derive(Default)]
+pub(crate) struct FoldCache {
+    session_key: Option<(u64, String)>,
+    prefix_end_id: Option<u64>,
+    prefix_run: Option<RunState>,
+    prefix_before: Option<Rc<V>>,
+    event_sigs: Vec<[u64; 2]>,
+    event_ids: Vec<Option<u64>>,
+    resolved_calls: Vec<Option<String>>,
+    checkpoints: Vec<(usize, RunState, Option<Rc<V>>)>,
+    last_run: RunState,
+    last_before: Option<Rc<V>>,
+}
+
+impl FoldCache {
+    fn sync_session(&mut self, epoch: u64, sid: &str) {
+        let matches = self
+            .session_key
+            .as_ref()
+            .is_some_and(|(e, s)| *e == epoch && s == sid);
+        if !matches {
+            self.clear();
+            self.session_key = Some((epoch, sid.to_owned()));
+        }
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.session_key = None;
+        self.prefix_end_id = None;
+        self.prefix_run = None;
+        self.prefix_before = None;
+        self.clear_checkpoints_only();
+    }
+
+    fn clear_checkpoints_only(&mut self) {
+        self.event_sigs.clear();
+        self.event_ids.clear();
+        self.resolved_calls.clear();
+        self.checkpoints.clear();
+        self.last_run = RunState::default();
+        self.last_before = None;
+    }
+
+    fn advance_pruned_prefix(&mut self, drained: &[V]) {
+        if drained.is_empty() {
+            return;
+        }
+        let matches_cached = self.event_sigs.len() >= drained.len()
+            && self
+                .event_sigs
+                .iter()
+                .zip(drained.iter())
+                .all(|(sig, ev)| *sig == event_fold_sig(ev));
+        let mut run = self.prefix_run.clone().unwrap_or_default();
+        let mut before = self.prefix_before.clone();
+        let mut max_id = self.prefix_end_id;
+        for ev in drained {
+            let ev_id = stream_event_id(ev);
+            let already_in_prefix = match (max_id, ev_id) {
+                (Some(prev), Some(cur)) => cur <= prev,
+                _ => false,
+            };
+            if !already_in_prefix {
+                let (replaced, _) = run.apply_event(ev);
+                if let Some(r) = replaced {
+                    before = Some(r);
+                }
+                if let Some(cur) = ev_id {
+                    max_id = Some(max_id.map_or(cur, |prev| prev.max(cur)));
+                }
+            }
+        }
+        self.prefix_end_id = max_id;
+        self.prefix_run = Some(run);
+        self.prefix_before = before;
+        if matches_cached {
+            let k = drained.len();
+            self.event_sigs.drain(..k);
+            self.event_ids.drain(..k);
+            self.resolved_calls.drain(..k);
+            self.checkpoints.retain_mut(|(idx, _, _)| {
+                if *idx > k {
+                    *idx -= k;
+                    true
+                } else {
+                    false
+                }
+            });
+        } else {
+            self.clear_checkpoints_only();
+        }
+    }
+
+    fn push_checkpoint(&mut self, idx: usize, run: &RunState, before: &Option<Rc<V>>) {
+        self.checkpoints.push((idx, run.clone(), before.clone()));
+        if self.checkpoints.len() > MAX_FOLD_CHECKPOINTS {
+            // Retain evenly spaced older checkpoints plus the newest suffix.
+            let drop_pos = self.checkpoints.len() / 2;
+            self.checkpoints.remove(drop_pos.saturating_sub(1));
+        }
+    }
+}
+
+thread_local! {
+    static FOLD_CACHE: RefCell<FoldCache> = RefCell::new(FoldCache::default());
+}
+
+/// Clears DOM-bound stream caches while retaining `TOOL_FULL_OUTPUTS` and pruned fold prefix across in-session replays.
+fn clear_stream_dom_caches() {
+    STREAM_MD_CACHE.with(|cache| cache.borrow_mut().clear());
+    STREAM_RAW_TEXT.with(|raw| raw.borrow_mut().clear());
+    CALL_BLOCK_CACHE.with(|cache| cache.borrow_mut().clear());
+    RENDERED_EVENT_IDS.with(|ids| ids.borrow_mut().clear());
+    LAST_MAX_RENDERED_ID.with(|max| max.set(None));
+    FOLD_CACHE.with(|cache| cache.borrow_mut().clear_checkpoints_only());
+    let evicted = TOOL_FULL_OUTPUTS.with(|cache| {
+        TOOL_OUTPUT_ORDER.with(|order| {
+            prune_tool_outputs_with_budget(
+                &mut cache.borrow_mut(),
+                &mut order.borrow_mut(),
+                TOOL_OUTPUT_MAX_CACHED_KEYS,
+                TOOL_OUTPUT_MAX_TOTAL_BYTES,
+            )
+        })
+    });
+    if cfg!(target_arch = "wasm32") && !evicted.is_empty() {
+        mark_evicted_tool_output_blocks(&evicted);
+    }
+}
+
+fn touch_tool_output_key(order: &mut VecDeque<String>, key: &str) {
+    if let Some(pos) = order.iter().position(|existing| existing == key) {
+        order.remove(pos);
+    }
+    order.push_back(key.to_owned());
+}
+
+pub(crate) fn prune_tool_outputs_with_budget(
+    map: &mut BTreeMap<String, String>,
+    order: &mut VecDeque<String>,
+    max_entries: usize,
+    max_total_bytes: usize,
+) -> Vec<String> {
+    let mut evicted = Vec::new();
+    let mut total_bytes: usize = map.values().map(String::len).sum();
+    while map.len() > max_entries || (total_bytes > max_total_bytes && map.len() > 1) {
+        let evict_key = loop {
+            match order.pop_front() {
+                Some(candidate) if map.contains_key(&candidate) => break Some(candidate),
+                Some(_) => continue,
+                None => break map.keys().next().cloned(),
+            }
+        };
+        let Some(key) = evict_key else {
+            break;
+        };
+        if let Some(removed) = map.remove(&key) {
+            total_bytes = total_bytes.saturating_sub(removed.len());
+            evicted.push(key);
+        }
+    }
+    evicted
+}
+
+#[cfg(test)]
+pub(crate) fn prune_tool_outputs_map(map: &mut BTreeMap<String, String>, max_entries: usize) {
+    let mut order = VecDeque::new();
+    prune_tool_outputs_with_budget(map, &mut order, max_entries, usize::MAX);
+}
+
+pub(crate) fn clear_stream_md_cache() {
+    clear_stream_dom_caches();
+    FOLD_CACHE.with(|cache| cache.borrow_mut().clear());
+    TOOL_FULL_OUTPUTS.with(|cache| cache.borrow_mut().clear());
+    TOOL_OUTPUT_ORDER.with(|order| order.borrow_mut().clear());
+}
+
+fn ensure_block_stream_key(block: &web_sys::Element) -> String {
+    if let Some(existing) = block
+        .get_attribute("data-stream-key")
+        .filter(|s| !s.is_empty())
+    {
+        return existing;
+    }
+    let seq = NEXT_STREAM_SEQ.with(|c| {
+        let n = c.get();
+        c.set(n.saturating_add(1));
+        n
+    });
+    let key = format!("stream-md-{seq}");
+    let _ = block.set_attribute("data-stream-key", &key);
+    key
+}
+
+fn read_block_raw_text(block: &web_sys::Element) -> String {
+    let Some(key) = block.get_attribute("data-stream-key") else {
+        return String::new();
+    };
+    STREAM_RAW_TEXT.with(|raw| raw.borrow().get(&key).cloned().unwrap_or_default())
+}
+
+fn write_block_raw_text(block: &web_sys::Element, text: &str) {
+    let key = ensure_block_stream_key(block);
+    STREAM_RAW_TEXT.with(|raw| {
+        raw.borrow_mut().insert(key, text.to_owned());
+    });
+}
+
+pub(crate) fn copy_timer_key(existing: Option<&str>, seq: u64) -> String {
+    match existing.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(id) => format!("md-copy-reset-{id}"),
+        None => format!("md-copy-reset-{seq}"),
+    }
+}
+
+fn parse_fence_opener(trimmed: &str) -> Option<(char, usize)> {
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let count = trimmed.chars().take_while(|c| *c == first).count();
+    if count >= 3 {
+        Some((first, count))
+    } else {
+        None
+    }
+}
+
+fn is_matching_fence_closer(trimmed: &str, open_ch: char, open_len: usize) -> bool {
+    if open_ch == '`' {
+        // `graph_explanation::render_markdown_html` toggles any line starting with "```".
+        return trimmed.starts_with("```");
+    }
+    let count = trimmed.chars().take_while(|c| *c == open_ch).count();
+    count >= open_len && trimmed[count * open_ch.len_utf8()..].trim().is_empty()
+}
+
+fn is_setext_underline(trimmed: &str) -> bool {
+    let Some(first) = trimmed.chars().next() else {
+        return false;
+    };
+    (first == '=' || first == '-') && trimmed.len() >= 2 && trimmed.chars().all(|c| c == first)
+}
+
+/// Finds the furthest safe byte boundary in `markdown` (starting at `start_from`,
+/// which must be outside any code fence) where all preceding blocks are complete
+/// and `render_markdown_html(&markdown[..b]) + render_markdown_html(&markdown[b..])`
+/// equals `render_markdown_html(markdown)`.
+pub(crate) fn find_settled_markdown_boundary(markdown: &str, start_from: usize) -> usize {
+    if start_from >= markdown.len() || !markdown.is_char_boundary(start_from) {
+        return start_from.min(markdown.len());
+    }
+    let mut fence: Option<(char, usize)> = None;
+    let mut best = start_from;
+    let mut pos = start_from;
+    for chunk in markdown[start_from..].split_inclusive('\n') {
+        let ended_with_nl = chunk.ends_with('\n');
+        let line = chunk.trim_end_matches(&['\r', '\n'][..]);
+        let trimmed = line.trim();
+        let next_pos = pos + chunk.len();
+        if let Some((open_ch, open_len)) = fence {
+            if is_matching_fence_closer(trimmed, open_ch, open_len) {
+                fence = None;
+                if ended_with_nl {
+                    best = next_pos;
+                }
+            }
+        } else if let Some((open_ch, open_len)) = parse_fence_opener(trimmed) {
+            fence = Some((open_ch, open_len));
+        } else if trimmed.is_empty() && ended_with_nl {
+            let rest = &markdown[next_pos..];
+            let next_line = rest.split('\n').next().unwrap_or("");
+            let next_trimmed = next_line.trim();
+            let indented_continuation = next_line.starts_with("  ") || next_line.starts_with('\t');
+            let looks_like_setext = !next_trimmed.is_empty() && is_setext_underline(next_trimmed);
+            if !indented_continuation && !looks_like_setext {
+                best = next_pos;
+            }
+        }
+        pos = next_pos;
+    }
+    best
+}
+
+fn is_void_html_tag(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "param"
+            | "source"
+            | "track"
+            | "wbr"
+    )
+}
+
+/// Splits top-level HTML block elements emitted by `render_assistant_markdown_html`.
+pub(crate) fn split_top_level_html_blocks(html: &str) -> Vec<String> {
+    let bytes = html.as_bytes();
+    let mut out = Vec::new();
+    let mut depth = 0usize;
+    let mut block_start = 0usize;
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i] != b'<' {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        let mut quote: Option<u8> = None;
+        while j < bytes.len() {
+            let b = bytes[j];
+            if let Some(q) = quote {
+                if b == q {
+                    quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                quote = Some(b);
+            } else if b == b'>' {
+                break;
+            }
+            j += 1;
+        }
+        if j >= bytes.len() {
+            break;
+        }
+        let tag_inner = html[i + 1..j].trim();
+        if !tag_inner.starts_with('!') && !tag_inner.starts_with('?') {
+            if tag_inner.starts_with('/') {
+                depth = depth.saturating_sub(1);
+            } else {
+                let name_end = tag_inner
+                    .find(|c: char| c.is_ascii_whitespace() || c == '/')
+                    .unwrap_or(tag_inner.len());
+                let tag_name = tag_inner[..name_end].to_ascii_lowercase();
+                let self_closing = tag_inner.ends_with('/') || is_void_html_tag(&tag_name);
+                if !self_closing {
+                    depth += 1;
+                }
+            }
+        }
+        let end_pos = j + 1;
+        if depth == 0 && end_pos > block_start {
+            let slice = &html[block_start..end_pos];
+            if !slice.is_empty() {
+                out.push(slice.to_owned());
+            }
+            block_start = end_pos;
+        }
+        i = end_pos;
+    }
+    if block_start < html.len() {
+        let rest = &html[block_start..];
+        if !rest.is_empty() {
+            out.push(rest.to_owned());
+        }
+    }
+    out
+}
+
+pub(crate) fn is_near_bottom(scroll_height: i32, scroll_top: i32, client_height: i32) -> bool {
+    scroll_height - scroll_top - client_height < 48
+}
+
+/// Joins consecutive streaming `text`/`thinking` chunks verbatim without injecting spurious newlines mid-word.
+pub(crate) fn coalesce_chunk_text(existing: &str, incoming: &str) -> String {
+    if existing.is_empty() {
+        return incoming.to_owned();
+    }
+    if incoming.is_empty() {
+        return existing.to_owned();
+    }
+    format!("{existing}{incoming}")
+}
+
+pub(crate) fn bounded_tool_output_preview(
+    full: &str,
+    max_chars: usize,
+) -> (String, Option<(usize, usize)>) {
+    let total_chars = full.chars().count();
+    if total_chars <= max_chars || max_chars == 0 {
+        return (full.to_owned(), None);
+    }
+    let skip_chars = total_chars - max_chars;
+    let mut byte_idx = full
+        .char_indices()
+        .nth(skip_chars)
+        .map(|(i, _)| i)
+        .unwrap_or(full.len());
+    let snap_window = (full.len() - byte_idx).min(max_chars / 4);
+    if let Some(rel_nl) = full[byte_idx..byte_idx + snap_window].find('\n') {
+        byte_idx += rel_nl + 1;
+    }
+    let tail = &full[byte_idx..];
+    let total_lines = full.lines().count().max(1);
+    let shown_lines = tail.lines().count().max(1);
+    (tail.to_owned(), Some((shown_lines, total_lines)))
+}
+
+/// Wraps fenced code blocks produced by `render_markdown_html` with a Copy button header.
+pub(crate) fn render_assistant_markdown_html(markdown: &str) -> String {
+    let raw_html = crate::graph_explanation::render_markdown_html(markdown);
+    wrap_markdown_code_blocks(&raw_html)
+}
+
+pub(crate) fn wrap_markdown_code_blocks(html: &str) -> String {
+    const PRE_PREFIX: &str = "<pre class=\"graph-md-pre\"><code class=\"graph-md-code\"";
+    const PRE_SUFFIX: &str = "</code></pre>";
+    let mut out = String::with_capacity(html.len() + 128);
+    let mut rest = html;
+    while let Some(start) = rest.find(PRE_PREFIX) {
+        out.push_str(&rest[..start]);
+        let after_prefix = &rest[start + PRE_PREFIX.len()..];
+        let Some(tag_end) = after_prefix.find('>') else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let attrs = &after_prefix[..tag_end];
+        let lang = attrs
+            .split("data-lang=\"")
+            .nth(1)
+            .and_then(|s| s.split('"').next())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("code");
+        let after_gt = &after_prefix[tag_end + 1..];
+        let Some(close_pos) = after_gt.find(PRE_SUFFIX) else {
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let code_body = &after_gt[..close_pos];
+        out.push_str(&format!(
+            "<div class=\"md-code-block\"><div class=\"md-code-head\"><span class=\"md-code-lang\">{}</span><button type=\"button\" class=\"button compact md-copy-code\" data-action=\"copy-code\">Copy</button></div>{PRE_PREFIX}{attrs}>{code_body}{PRE_SUFFIX}</div>",
+            files_map::escape_html(lang),
+        ));
+        rest = &after_gt[close_pos + PRE_SUFFIX.len()..];
+    }
+    out.push_str(rest);
+    out
+}
+
+pub(crate) fn conversation_event_call_id(v: &V, resolved_call: Option<&str>) -> String {
+    v["call_id"]
+        .as_str()
+        .or_else(|| v["call"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .or_else(|| resolved_call.map(str::trim).filter(|s| !s.is_empty()))
+        .unwrap_or("")
+        .to_owned()
+}
+
+pub(super) fn extract_hint_paths(v: &V, text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for key in ["path", "file", "detail"] {
+        if let Some(p) = v[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            let clean_p = tidy(p);
+            if (clean_p.contains('/') || clean_p.contains('.')) && !out.contains(&clean_p) {
+                out.push(clean_p);
+            }
+        }
+    }
+    for token in text.split_whitespace() {
+        let trimmed =
+            token.trim_matches(|c: char| matches!(c, '\'' | '"' | ',' | ';' | '(' | ')' | ':'));
+        let path_part = trimmed.split(':').next().unwrap_or(trimmed);
+        if (path_part.contains('/') || path_part.ends_with(".rs") || path_part.ends_with(".php"))
+            && path_part.len() <= 240
+            && !path_part.starts_with("http")
+        {
+            let clean_p = tidy(path_part);
+            if !clean_p.is_empty() && !out.contains(&clean_p) {
+                out.push(clean_p);
+                if out.len() >= 8 {
+                    break;
+                }
+            }
+        }
+    }
+    out
+}
+
+pub(crate) fn failure_localize_payload(v: &V, text: &str) -> V {
+    let mut queries = Vec::new();
+    for key in ["command", "detail", "path"] {
+        if let Some(val) = v[key].as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            let short: String = val.chars().take(160).collect();
+            if !queries.contains(&short) {
+                queries.push(short);
+            }
+        }
+    }
+    if queries.is_empty() && !text.trim().is_empty() {
+        let first_line: String = text
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .chars()
+            .take(160)
+            .collect();
+        if !first_line.is_empty() {
+            queries.push(first_line);
+        }
+    }
+    let hint_paths = extract_hint_paths(v, text);
+    let project_id = {
+        let p = m::text(&m::read(|s| s.selected.clone()), "project_id");
+        if !p.is_empty() {
+            p
+        } else {
+            m::current_project()
+        }
+    };
+    json!({
+        "project_id": project_id,
+        "session_id": m::read(|s| s.sid.clone()),
+        "failing_queries": queries,
+        "hint_paths": hint_paths,
+        "prefer_full_modal": false
+    })
+}
+
+fn find_tool_block_by_call_id(
+    container: &web_sys::Element,
+    call_id: &str,
+) -> Option<web_sys::Element> {
+    if call_id.is_empty() {
+        return None;
+    }
+    if container.id() == "events" {
+        if let Some(cached) = CALL_BLOCK_CACHE.with(|c| c.borrow().get(call_id).cloned()) {
+            if cached.is_connected()
+                && container.contains(Some(&cached))
+                && cached.get_attribute("data-call-id").as_deref() == Some(call_id)
+            {
+                return Some(cached);
+            }
+        }
+    }
+    let selector = format!(
+        "details.conversation-tool[data-call-id=\"{}\"]",
+        crate::dom::escape_css_attr_value(call_id)
+    );
+    let found = container.query_selector(&selector).ok().flatten();
+    if container.id() == "events" {
+        if let Some(el) = &found {
+            CALL_BLOCK_CACHE.with(|c| {
+                c.borrow_mut().insert(call_id.to_owned(), el.clone());
+            });
+        }
+    }
+    found
+}
+
+fn store_tool_output(key: &str, incoming: &str, reset: bool) -> String {
+    let (bounded, evicted) = TOOL_FULL_OUTPUTS.with(|map| {
+        let mut map = map.borrow_mut();
+        let combined = if reset {
+            incoming.to_owned()
+        } else if let Some(prev) = map.get(key) {
+            if prev.is_empty() {
+                incoming.to_owned()
+            } else if prev == incoming {
+                prev.clone()
+            } else {
+                format!("{prev}\n{incoming}")
+            }
+        } else {
+            incoming.to_owned()
+        };
+        let char_count = combined.chars().count();
+        let bounded = if char_count > TOOL_OUTPUT_MAX_STORED_CHARS {
+            let skip = char_count - TOOL_OUTPUT_MAX_STORED_CHARS;
+            let byte_idx = combined
+                .char_indices()
+                .nth(skip)
+                .map(|(i, _)| i)
+                .unwrap_or(0);
+            format!("[… earlier output omitted …]\n{}", &combined[byte_idx..])
+        } else {
+            combined
+        };
+        map.insert(key.to_owned(), bounded.clone());
+        let evicted = TOOL_OUTPUT_ORDER.with(|order| {
+            let mut order = order.borrow_mut();
+            touch_tool_output_key(&mut order, key);
+            prune_tool_outputs_with_budget(
+                &mut map,
+                &mut order,
+                TOOL_OUTPUT_MAX_CACHED_KEYS,
+                TOOL_OUTPUT_MAX_TOTAL_BYTES,
+            )
+        });
+        (bounded, evicted)
+    });
+    if cfg!(target_arch = "wasm32") && !evicted.is_empty() {
+        mark_evicted_tool_output_blocks(&evicted);
+    }
+    bounded
+}
+
+pub(crate) fn evicted_tool_output_label() -> &'static str {
+    "Evicted from memory — reload earlier"
+}
+
+fn mark_tool_output_evicted(block: &web_sys::Element) {
+    let _ = block.set_attribute("data-output-expanded", "false");
+    let _ = block.set_attribute("data-output-evicted", "true");
+    let Ok(Some(bar)) = block.query_selector(".tool-output-trunc") else {
+        return;
+    };
+    bar.set_text_content(None);
+    dom::add(&bar, &dom::el("span", "muted", evicted_tool_output_label()));
+    let btn = dom::el("button", "button compact", evicted_tool_output_label());
+    let _ = btn.set_attribute("type", "button");
+    let _ = btn.set_attribute("disabled", "");
+    dom::add(&bar, &btn);
+}
+
+fn mark_evicted_tool_output_blocks(evicted_keys: &[String]) {
+    for key in evicted_keys {
+        let selector = format!(
+            "details.conversation-tool[data-output-key=\"{}\"]",
+            crate::dom::escape_css_attr_value(key)
+        );
+        if let Ok(Some(block)) = dom::document().query_selector(&selector) {
+            mark_tool_output_evicted(&block);
+        }
+    }
+}
+
+fn apply_tool_output_dom(block: &web_sys::Element, output_key: &str, full_text: &str) {
+    let expanded = block.get_attribute("data-output-expanded").as_deref() == Some("true");
+    let (preview, trunc_info) = bounded_tool_output_preview(full_text, TOOL_OUTPUT_PREVIEW_CHARS);
+    if let Ok(Some(pre)) = block.query_selector("pre.tool-output") {
+        let shown = if expanded || trunc_info.is_none() {
+            full_text
+        } else {
+            preview.as_str()
+        };
+        if pre.text_content().as_deref() != Some(shown) {
+            pre.set_text_content(Some(shown));
+        }
+    }
+    let existing_trunc = block.query_selector(".tool-output-trunc").ok().flatten();
+    if let Some((shown_lines, total_lines)) = trunc_info {
+        let bar = existing_trunc.unwrap_or_else(|| {
+            let b = dom::el("div", "tool-output-trunc", "");
+            let _ = block.set_attribute("data-output-key", output_key);
+            if let Ok(Some(pre)) = block.query_selector("pre.tool-output") {
+                let _ = pre.after_with_node_1(&b);
+            } else {
+                dom::add(block, &b);
+            }
+            b
+        });
+        bar.set_text_content(None);
+        let note_text = if expanded {
+            format!("Showing full output ({total_lines} lines)")
+        } else {
+            format!("Showing last {shown_lines} of {total_lines} lines")
+        };
+        dom::add(&bar, &dom::el("span", "muted", &note_text));
+        let btn = dom::button(
+            if expanded {
+                "Show tail only"
+            } else {
+                "Show full output"
+            },
+            "tool-output-expand",
+            json!(output_key),
+        );
+        let _ = btn.class_list().add_1("compact");
+        dom::add(&bar, &btn);
+    } else if let Some(bar) = existing_trunc {
+        bar.remove();
+    }
+}
+
+pub(crate) fn toggle_tool_output_expand(output_key: &str) {
+    if output_key.is_empty() {
+        return;
+    }
+    let selector = format!(
+        "details.conversation-tool[data-output-key=\"{}\"]",
+        crate::dom::escape_css_attr_value(output_key)
+    );
+    let Ok(Some(block)) = dom::document().query_selector(&selector) else {
+        return;
+    };
+    let full_text = TOOL_FULL_OUTPUTS.with(|map| map.borrow().get(output_key).cloned());
+    let Some(full) = full_text else {
+        mark_tool_output_evicted(&block);
+        return;
+    };
+    let expanded = block.get_attribute("data-output-expanded").as_deref() == Some("true");
+    let _ = block.set_attribute(
+        "data-output-expanded",
+        if expanded { "false" } else { "true" },
+    );
+    apply_tool_output_dom(&block, output_key, &full);
+}
+
+fn format_tool_summary(v: &V) -> String {
+    let target = v["path"]
+        .as_str()
+        .or_else(|| v["detail"].as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|s| format!(" · {}", s.chars().take(80).collect::<String>()))
+        .unwrap_or_default();
+    let state_label = if starts(v) {
+        "Running"
+    } else if v["ok"] == false {
+        "Failed"
+    } else {
+        "Completed"
+    };
+    format!("{} · {state_label}{target}", tool_name(v))
+}
+
+fn sync_tool_failure_button(block: &web_sys::Element, v: &V, text: &str, failed: bool) {
+    let existing = block
+        .query_selector("[data-action=\"localize-run-failure\"]")
+        .ok()
+        .flatten();
+    if !failed {
+        if let Some(btn) = existing {
+            btn.remove();
+        }
+        return;
+    }
+    let payload = failure_localize_payload(v, text);
+    match existing {
+        Some(btn) => {
+            let _ = btn.set_attribute("data-payload", &payload.to_string());
+        }
+        None => {
+            let btn = dom::button("Localize failure on map", "localize-run-failure", payload);
+            let _ = btn.class_list().add_1("compact");
+            dom::add(block, &btn);
+        }
+    }
+}
+
+pub(crate) fn update_scroll_ui() {
+    let unseen = m::read(|s| s.stream.unseen_count);
+    let sticky = m::read(|s| s.stream.sticky_bottom);
+    let show = !sticky && unseen > 0;
+    dom::hidden("events-jump-latest", !show);
+    if show {
+        let label = if unseen == 1 {
+            "Jump to latest (1 new)".to_owned()
+        } else {
+            format!("Jump to latest ({unseen} new)")
+        };
+        dom::text("events-jump-latest", &label);
+    } else {
+        dom::text("events-jump-latest", "Jump to latest");
+    }
+}
+
+pub(crate) fn on_conversation_scroll() {
+    let Some(el) = dom::get("conversation") else {
+        return;
+    };
+    let near = is_near_bottom(el.scroll_height(), el.scroll_top(), el.client_height());
+    m::write(|s| {
+        s.stream.sticky_bottom = near;
+        if near {
+            s.stream.unseen_count = 0;
+        }
+    });
+    update_scroll_ui();
+}
+
+pub(crate) fn jump_to_latest() {
+    if let Some(el) = dom::get("conversation") {
+        el.set_scroll_top(el.scroll_height());
+    }
+    m::write(|s| {
+        s.stream.sticky_bottom = true;
+        s.stream.unseen_count = 0;
+    });
+    update_scroll_ui();
+}
+
+pub(crate) fn compute_client_hidden_prefix(
+    events: &[V],
+    limit: usize,
+    first_rendered_event_id: Option<u64>,
+) -> usize {
+    let limit_start = events.len().saturating_sub(limit);
+    if let Some(first_id) = first_rendered_event_id {
+        if let Some(pos) = events
+            .iter()
+            .position(|ev| stream_event_id(ev) == Some(first_id))
+        {
+            return pos;
+        }
+    }
+    limit_start
+}
+
+fn is_pending_permission_block(el: &web_sys::Element) -> bool {
+    el.class_list().contains("conversation-permission")
+        && el.get_attribute("data-state").as_deref() == Some("pending")
+}
+
+pub(crate) fn fold_min_rendered_event_id(acc: Option<u64>, candidate: Option<u64>) -> Option<u64> {
+    match (acc, candidate) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (a @ Some(_), None) | (None, a) => a,
+    }
+}
+
+fn earliest_rendered_dom_event_id() -> Option<u64> {
+    let container = dom::get("events")?;
+    let mut best = None;
+    for el in dom::children(&container) {
+        if is_pending_permission_block(&el) {
+            continue;
+        }
+        let id = el
+            .get_attribute("data-first-event-id")
+            .or_else(|| el.get_attribute("data-event-id"))
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        best = fold_min_rendered_event_id(best, id);
+    }
+    best
+}
+
+pub(crate) fn sync_load_earlier_control() {
+    let (events, limit, has_older, loading) = m::read(|s| {
+        (
+            s.events.clone(),
+            s.stream.visible_limit,
+            s.stream.has_older,
+            s.stream.loading_older,
+        )
+    });
+    let first_rendered_id = if cfg!(target_arch = "wasm32") {
+        earliest_rendered_dom_event_id()
+    } else {
+        None
+    };
+    let client_hidden = compute_client_hidden_prefix(&events, limit, first_rendered_id);
+    let show = has_older || client_hidden > 0;
+    dom::hidden("events-load-earlier-wrap", !show);
+    dom::disabled("events-load-earlier", loading);
+    if show {
+        let label = if loading {
+            "Loading earlier messages…".to_owned()
+        } else if client_hidden > 0 {
+            format!("Load earlier messages ({client_hidden} loaded)")
+        } else {
+            "Load earlier messages".to_owned()
+        };
+        dom::text("events-load-earlier", &label);
+    }
+}
+
+fn parse_single_html_node(html: &str) -> Option<web_sys::Element> {
+    let wrapper = dom::el("div", "", "");
+    wrapper.set_inner_html(html);
+    wrapper.first_element_child()
+}
+
+fn try_patch_streaming_code_block(existing: &web_sys::Element, new_html: &str) -> bool {
+    if !existing.class_list().contains("md-code-block") {
+        return false;
+    }
+    let Some(fresh) = parse_single_html_node(new_html) else {
+        return false;
+    };
+    if !fresh.class_list().contains("md-code-block") {
+        return false;
+    }
+    let old_lang = existing
+        .query_selector(".md-code-lang")
+        .ok()
+        .flatten()
+        .and_then(|e| e.text_content());
+    let new_lang = fresh
+        .query_selector(".md-code-lang")
+        .ok()
+        .flatten()
+        .and_then(|e| e.text_content());
+    if old_lang != new_lang {
+        return false;
+    }
+    let (Ok(Some(old_code)), Ok(Some(new_code))) = (
+        existing.query_selector("pre code"),
+        fresh.query_selector("pre code"),
+    ) else {
+        return false;
+    };
+    old_code.set_text_content(new_code.text_content().as_deref());
+    true
+}
+
+pub(crate) fn build_init_stream_markdown(text: &str) -> (String, StreamMdEntry) {
+    let settled_bytes = find_settled_markdown_boundary(text, 0);
+    if settled_bytes > 0 && settled_bytes <= text.len() && text.is_char_boundary(settled_bytes) {
+        let settled_html = render_assistant_markdown_html(&text[..settled_bytes]);
+        let settled_count = split_top_level_html_blocks(&settled_html).len();
+        let (tail_html, tail_blocks) = if settled_bytes < text.len() {
+            let html = render_assistant_markdown_html(&text[settled_bytes..]);
+            let blocks = split_top_level_html_blocks(&html);
+            (html, blocks)
+        } else {
+            (String::new(), Vec::new())
+        };
+        let combined = if tail_html.is_empty() {
+            settled_html
+        } else {
+            format!("{settled_html}{tail_html}")
+        };
+        (
+            combined,
+            StreamMdEntry {
+                settled_bytes,
+                settled_dom_blocks: settled_count,
+                tail_blocks,
+            },
+        )
+    } else {
+        let html = render_assistant_markdown_html(text);
+        let tail_blocks = split_top_level_html_blocks(&html);
+        (
+            html,
+            StreamMdEntry {
+                settled_bytes: 0,
+                settled_dom_blocks: 0,
+                tail_blocks,
+            },
+        )
+    }
+}
+
+fn init_stream_markdown_body(block: &web_sys::Element, body: &web_sys::Element, text: &str) {
+    let stream_key = ensure_block_stream_key(block);
+    let (html, entry) = build_init_stream_markdown(text);
+    body.set_inner_html(&html);
+    STREAM_MD_CACHE.with(|cache| {
+        cache.borrow_mut().insert(stream_key, entry);
+    });
+}
+
+fn patch_stream_markdown_body(block: &web_sys::Element, body: &web_sys::Element, combined: &str) {
+    let stream_key = block.get_attribute("data-stream-key").unwrap_or_default();
+    if stream_key.is_empty() {
+        init_stream_markdown_body(block, body, combined);
+        return;
+    }
+    let mut entry = STREAM_MD_CACHE
+        .with(|cache| cache.borrow().get(&stream_key).cloned())
+        .unwrap_or_default();
+    if entry.settled_bytes > combined.len() || !combined.is_char_boundary(entry.settled_bytes) {
+        init_stream_markdown_body(block, body, combined);
+        return;
+    }
+
+    let tail_md = &combined[entry.settled_bytes..];
+    let tail_html = render_assistant_markdown_html(tail_md);
+    let new_tail_blocks = split_top_level_html_blocks(&tail_html);
+    let keep = entry
+        .tail_blocks
+        .iter()
+        .zip(new_tail_blocks.iter())
+        .take_while(|(old_b, new_b)| old_b == new_b)
+        .count();
+
+    let children = body.children();
+    let expected_total = entry.settled_dom_blocks + entry.tail_blocks.len();
+    if (children.length() as usize) != expected_total {
+        // DOM diverged unexpectedly; fall back cleanly and re-seed cache.
+        init_stream_markdown_body(block, body, combined);
+        return;
+    }
+
+    let start_idx = entry.settled_dom_blocks + keep;
+    let existing_replace_end =
+        (entry.settled_dom_blocks + new_tail_blocks.len()).min(expected_total);
+    let mut idx = start_idx;
+    while idx < existing_replace_end {
+        let tail_idx = idx - entry.settled_dom_blocks;
+        if let Some(existing_el) = children.item(idx as u32) {
+            if !try_patch_streaming_code_block(&existing_el, &new_tail_blocks[tail_idx]) {
+                if let Some(fresh_el) = parse_single_html_node(&new_tail_blocks[tail_idx]) {
+                    let _ = existing_el.replace_with_with_node_1(&fresh_el);
+                }
+            }
+        }
+        idx += 1;
+    }
+
+    let target_total = entry.settled_dom_blocks + new_tail_blocks.len();
+    while (body.children().length() as usize) > target_total {
+        if let Some(last_child) = body.last_element_child() {
+            last_child.remove();
+        } else {
+            break;
+        }
+    }
+    for new_block in new_tail_blocks
+        .iter()
+        .skip(existing_replace_end - entry.settled_dom_blocks)
+    {
+        if let Some(fresh_el) = parse_single_html_node(new_block) {
+            let _ = body.append_child(&fresh_el);
+        }
+    }
+
+    let next_settled = find_settled_markdown_boundary(combined, entry.settled_bytes);
+    if next_settled > entry.settled_bytes && combined.is_char_boundary(next_settled) {
+        let newly_settled_count = split_top_level_html_blocks(&render_assistant_markdown_html(
+            &combined[entry.settled_bytes..next_settled],
+        ))
+        .len();
+        if newly_settled_count <= new_tail_blocks.len() {
+            entry.settled_bytes = next_settled;
+            entry.settled_dom_blocks += newly_settled_count;
+            entry.tail_blocks = new_tail_blocks[newly_settled_count..].to_vec();
+        } else {
+            entry.tail_blocks = new_tail_blocks;
+        }
+    } else {
+        entry.tail_blocks = new_tail_blocks;
+    }
+
+    STREAM_MD_CACHE.with(|cache| {
+        cache.borrow_mut().insert(stream_key, entry);
+    });
+}
+
+#[allow(dead_code)]
+pub(crate) fn conversation(v: &V) {
+    conversation_with_call(v, None);
+}
+
+fn stream_event_id(v: &V) -> Option<u64> {
+    v["id"]
+        .as_u64()
+        .or_else(|| v["id"].as_str()?.trim().parse().ok())
+}
+
+fn record_rendered_event_id(v: &V) {
+    if let Some(id) = stream_event_id(v) {
+        RENDERED_EVENT_IDS.with(|ids| {
+            ids.borrow_mut().insert(id);
+        });
+        LAST_MAX_RENDERED_ID.with(|max| {
+            let next = max.get().map_or(id, |prev| prev.max(id));
+            max.set(Some(next));
+        });
+    }
+}
+
+pub(crate) fn dom_block_cap(sticky: bool) -> usize {
+    if sticky {
+        LIVE_STICKY_DOM_BLOCK_CAP
+    } else {
+        SCROLLED_UP_DOM_BLOCK_CAP
+    }
+}
+
+pub(crate) fn plan_top_dom_eviction(can_evict: &[bool], cap: usize) -> Vec<usize> {
+    if can_evict.len() <= cap {
+        return Vec::new();
+    }
+    let excess = can_evict.len() - cap;
+    can_evict
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, &evictable)| evictable.then_some(idx))
+        .take(excess)
+        .collect()
+}
+
+pub(crate) fn plan_state_events_prune_count(
+    events: &[V],
+    cap: usize,
+    min_keep_id: Option<u64>,
+) -> usize {
+    if events.len() <= cap {
+        return 0;
+    }
+    let excess = events.len() - cap;
+    let mut prune_count = 0usize;
+    for ev in events.iter().take(excess) {
+        if let Some(keep_id) = min_keep_id {
+            if stream_event_id(ev).is_some_and(|id| id >= keep_id) {
+                break;
+            }
+        }
+        prune_count += 1;
+    }
+    prune_count
+}
+
+fn prune_state_events_to_cap() {
+    let min_keep_id = if cfg!(target_arch = "wasm32") {
+        earliest_rendered_dom_event_id()
+    } else {
+        None
+    };
+    let (epoch, sid, drained) = m::write(|s| {
+        let prune_count =
+            plan_state_events_prune_count(&s.events, STATE_EVENTS_HARD_CAP, min_keep_id);
+        if prune_count == 0 {
+            return (s.epoch, s.sid.clone(), Vec::new());
+        }
+        let (drained, oldest, drained_any_numeric) =
+            m::prune_events_prefix(&mut s.events, &mut s.seen, prune_count);
+        if drained_any_numeric {
+            s.stream.has_older = true;
+        }
+        if let Some(oldest_id) = oldest {
+            s.stream.oldest_event_id = Some(oldest_id);
+        }
+        s.stream.visible_limit = s.stream.visible_limit.min(s.events.len().max(1));
+        (s.epoch, s.sid.clone(), drained)
+    });
+    if !drained.is_empty() {
+        FOLD_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.sync_session(epoch, &sid);
+            cache.advance_pruned_prefix(&drained);
+        });
+    }
+}
+
+pub(crate) fn clamped_visible_limit_after_eviction(
+    events: &[V],
+    current_limit: usize,
+    evicted_ranges: &[(u64, u64)],
+) -> usize {
+    let Some(max_evicted_id) = evicted_ranges.iter().map(|(_, hi)| *hi).max() else {
+        return current_limit;
+    };
+    let Some(evicted_idx) = events
+        .iter()
+        .rposition(|ev| stream_event_id(ev).is_some_and(|id| id <= max_evicted_id))
+    else {
+        return current_limit;
+    };
+    let remaining = events.len().saturating_sub(evicted_idx + 1).max(1);
+    current_limit.min(remaining)
+}
+
+fn evict_excess_top_dom_nodes(
+    container: &web_sys::Element,
+    cap: usize,
+    conv: Option<&web_sys::Element>,
+    was_sticky: bool,
+) {
+    let children = dom::children(container);
+    if children.len() <= cap {
+        return;
+    }
+    let can_evict: Vec<bool> = children
+        .iter()
+        .map(|el| {
+            !(el.class_list().contains("conversation-permission")
+                && el.get_attribute("data-state").as_deref() == Some("pending"))
+        })
+        .collect();
+    let indices = plan_top_dom_eviction(&can_evict, cap);
+    if indices.is_empty() {
+        return;
+    }
+    let prev_metrics = (!was_sticky)
+        .then(|| conv.map(|c| (c.scroll_height(), c.scroll_top())))
+        .flatten();
+    let mut evicted_ranges: Vec<(u64, u64)> = Vec::new();
+    let mut evicted_stream_keys: Vec<String> = Vec::new();
+    let mut evicted_call_ids: Vec<String> = Vec::new();
+    for idx in indices {
+        let el = &children[idx];
+        if let Some(last_id) = el
+            .get_attribute("data-event-id")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+        {
+            let first_id = el
+                .get_attribute("data-first-event-id")
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .unwrap_or(last_id);
+            evicted_ranges.push((first_id.min(last_id), first_id.max(last_id)));
+        }
+        if let Some(sk) = el
+            .get_attribute("data-stream-key")
+            .filter(|s| !s.is_empty())
+        {
+            evicted_stream_keys.push(sk);
+        }
+        if let Some(cid) = el.get_attribute("data-call-id").filter(|s| !s.is_empty()) {
+            evicted_call_ids.push(cid);
+        }
+        el.remove();
+    }
+    if !evicted_stream_keys.is_empty() {
+        STREAM_MD_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            for key in &evicted_stream_keys {
+                cache.remove(key);
+            }
+        });
+        STREAM_RAW_TEXT.with(|raw| {
+            let mut raw = raw.borrow_mut();
+            for key in &evicted_stream_keys {
+                raw.remove(key);
+            }
+        });
+    }
+    if !evicted_call_ids.is_empty() {
+        CALL_BLOCK_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            for cid in &evicted_call_ids {
+                cache.remove(cid);
+            }
+        });
+    }
+    if !evicted_ranges.is_empty() {
+        let new_max = RENDERED_EVENT_IDS.with(|ids| {
+            let mut ids = ids.borrow_mut();
+            ids.retain(|id| {
+                !evicted_ranges
+                    .iter()
+                    .any(|(lo, hi)| (lo..=hi).contains(&id))
+            });
+            ids.iter().copied().max()
+        });
+        LAST_MAX_RENDERED_ID.with(|cell| cell.set(new_max));
+        // Keep `s.stream.visible_limit` at or below the non-evicted suffix so the next
+        // `replay_visible_stream()` never re-inserts and immediately re-evicts pruned prefix events.
+        m::write(|s| {
+            s.stream.visible_limit = clamped_visible_limit_after_eviction(
+                &s.events,
+                s.stream.visible_limit,
+                &evicted_ranges,
+            );
+        });
+    }
+    if let (Some((prev_h, prev_top)), Some(c)) = (prev_metrics, conv) {
+        let new_h = c.scroll_height();
+        let removed_h = prev_h - new_h;
+        if removed_h > 0 {
+            c.set_scroll_top((prev_top - removed_h).max(0));
+        }
+    }
+}
+
+pub(super) fn conversation_with_call(v: &V, resolved_call: Option<&str>) {
+    record_rendered_event_id(v);
+    let Some(events_el) = dom::get("events") else {
+        return;
+    };
+    let was_sticky = dom::get("conversation")
+        .map(|c| {
+            m::read(|s| s.stream.sticky_bottom)
+                || is_near_bottom(c.scroll_height(), c.scroll_top(), c.client_height())
+        })
+        .unwrap_or(true);
+    if !render_event_into(&events_el, v, resolved_call, true) {
+        return;
+    }
+    let conv = dom::get("conversation");
+    evict_excess_top_dom_nodes(
+        &events_el,
+        dom_block_cap(was_sticky),
+        conv.as_ref(),
+        was_sticky,
+    );
+    prune_state_events_to_cap();
+    if let Some(conv) = conv {
+        if was_sticky {
+            conv.set_scroll_top(conv.scroll_height());
+            m::write(|s| {
+                s.stream.sticky_bottom = true;
+                s.stream.unseen_count = 0;
+            });
+        } else {
+            m::write(|s| {
+                s.stream.sticky_bottom = false;
+                s.stream.unseen_count = s.stream.unseen_count.saturating_add(1);
+            });
+        }
+    }
+    update_scroll_ui();
+    sync_load_earlier_control();
+}
+
+fn render_event_into(
+    container: &web_sys::Element,
+    v: &V,
+    resolved_call: Option<&str>,
+    live_mode: bool,
+) -> bool {
+    let kind = m::text(v, "kind");
+    if kind == "permission" {
+        if live_mode {
+            permission(v);
+            if v["state"].as_str() == Some("pending") || v["state"].is_null() {
+                dom::announce("run-announcer", &permission_heading(v));
+            }
+        } else {
+            let request = m::text(v, "request_id");
+            let already_in_events = !request.is_empty()
+                && dom::get("events")
+                    .and_then(|ev| {
+                        ev.query_selector(&format!(
+                            "[data-permission-id=\"{}\"]",
+                            crate::dom::escape_css_attr_value(&request)
+                        ))
+                        .ok()
+                        .flatten()
+                    })
+                    .is_some();
+            if !request.is_empty() && !already_in_events {
+                super::permissions::upsert_permission_card_in(container, "events", v, false, false);
+            }
+        }
+        return false;
+    }
+    let text = clean(&m::text(v, "text"));
+    let id = m::string(&v["id"]);
+    if ![
+        "text",
+        "thinking",
+        "tool",
+        "status",
+        "error",
+        "memory",
+        "omnigraph",
+        "skillcache",
+        "delegation",
+        "clash_turn",
+        "clash_state",
+        "user",
+        "result",
+    ]
+    .contains(&kind.as_str())
+    {
+        return false;
+    }
+    if matches!(kind.as_str(), "text" | "thinking") && text.is_empty() {
+        return false;
+    }
+
+    let mut mutated_existing = false;
+    if kind == "tool" {
+        let call_id = conversation_event_call_id(v, resolved_call);
+        if let Some(block) = find_tool_block_by_call_id(container, &call_id) {
+            update_existing_tool_block(&block, v, resolved_call);
+            mutated_existing = true;
+        }
+    } else if matches!(kind.as_str(), "text" | "thinking") {
+        let can_coalesce = container
+            .last_element_child()
+            .filter(|last| last.get_attribute("data-chunk-kind").as_deref() == Some(kind.as_str()));
+        if let Some(last) = can_coalesce {
+            let prev = read_block_raw_text(&last);
+            let combined = coalesce_chunk_text(&prev, &text);
+            write_block_raw_text(&last, &combined);
+            let _ = last.set_attribute("data-event-id", &id);
+            if kind == "text" {
+                if let Ok(Some(body)) = last.query_selector(".md-body") {
+                    if live_mode {
+                        patch_stream_markdown_body(&last, &body, &combined);
+                    } else {
+                        body.set_inner_html(&render_assistant_markdown_html(&combined));
+                    }
+                } else {
+                    let body = dom::el("div", "md-body", "");
+                    if live_mode {
+                        init_stream_markdown_body(&last, &body, &combined);
+                    } else {
+                        body.set_inner_html(&render_assistant_markdown_html(&combined));
+                    }
+                    last.set_text_content(None);
+                    dom::add(&last, &body);
+                }
+            } else if let Ok(Some(pre)) = last.query_selector("pre.thinking-text") {
+                pre.set_text_content(Some(&combined));
+            }
+            mutated_existing = true;
+        }
+    }
+
+    if !mutated_existing {
+        let block = dom::el(
+            if kind == "tool" { "details" } else { "div" },
+            &format!("conversation-{kind}"),
+            "",
+        );
+        let _ = block.set_attribute("data-first-event-id", &id);
+        let _ = block.set_attribute("data-event-id", &id);
+        match kind.as_str() {
+            "tool" => {
+                let call_id = conversation_event_call_id(v, resolved_call);
+                if !call_id.is_empty() {
+                    let _ = block.set_attribute("data-call-id", &call_id);
+                    if container.id() == "events" {
+                        CALL_BLOCK_CACHE.with(|c| {
+                            c.borrow_mut().insert(call_id.clone(), block.clone());
+                        });
+                    }
+                }
+                let is_start = starts(v);
+                let failed = !is_start && v["ok"] == false;
+                let state_str = if is_start {
+                    "running"
+                } else if failed {
+                    "failed"
+                } else {
+                    "completed"
+                };
+                let output_key = if !call_id.is_empty() {
+                    call_id.clone()
+                } else {
+                    format!("ev:{id}")
+                };
+                let _ = block.set_attribute("data-tool-state", state_str);
+                let _ = block.set_attribute("data-output-key", &output_key);
+                dom::add(&block, &dom::el("summary", "", &format_tool_summary(v)));
+                dom::add(&block, &dom::el("pre", "tool-output", ""));
+                let full_text = store_tool_output(&output_key, &text, true);
+                apply_tool_output_dom(&block, &output_key, &full_text);
+                sync_tool_failure_button(&block, v, &full_text, failed);
+            }
+            "text" => {
+                let _ = block.set_attribute("data-chunk-kind", "text");
+                write_block_raw_text(&block, &text);
+                let body = dom::el("div", "md-body", "");
+                if live_mode {
+                    init_stream_markdown_body(&block, &body, &text);
+                } else {
+                    body.set_inner_html(&render_assistant_markdown_html(&text));
+                }
+                dom::add(&block, &body);
+            }
+            "thinking" => {
+                let _ = block.set_attribute("data-chunk-kind", "thinking");
+                write_block_raw_text(&block, &text);
+                let details = dom::el("details", "thinking-details", "");
+                dom::add(
+                    &details,
+                    &dom::el("summary", "thinking-summary", "Thinking"),
+                );
+                dom::add(&details, &dom::el("pre", "thinking-text", &text));
+                dom::add(&block, &details);
+            }
+            "error" => {
+                let _ = block.set_attribute("role", "alert");
+                dom::add(&block, &dom::el("p", "", &text));
+                if !text.trim().is_empty() {
+                    let btn = dom::button(
+                        "Localize failure on map",
+                        "localize-run-failure",
+                        failure_localize_payload(v, &text),
+                    );
+                    let _ = btn.class_list().add_1("compact");
+                    dom::add(&block, &btn);
+                }
+                if live_mode {
+                    dom::announce("run-announcer", &format!("Error: {text}"));
+                }
+            }
+            "result" => {
+                if !text.trim().is_empty() {
+                    let body = dom::el("div", "md-body", "");
+                    body.set_inner_html(&render_assistant_markdown_html(&text));
+                    dom::add(&block, &body);
+                }
+                if live_mode {
+                    let msg = if text.is_empty() {
+                        format!("Turn {}", m::text(v, "status"))
+                    } else {
+                        text.clone()
+                    };
+                    dom::announce("run-announcer", &msg);
+                }
+            }
+            "status" => {
+                dom::add(&block, &dom::el("p", "", &text));
+                if live_mode
+                    && matches!(
+                        v["status"].as_str(),
+                        Some("completed" | "failed" | "cancelled")
+                    )
+                {
+                    let msg = if text.is_empty() {
+                        format!("Turn {}", m::text(v, "status"))
+                    } else {
+                        text.clone()
+                    };
+                    dom::announce("run-announcer", &msg);
+                }
+            }
+            "user" => {
+                if !text.trim().is_empty() {
+                    let body = dom::el("div", "md-body", "");
+                    body.set_inner_html(&render_assistant_markdown_html(&text));
+                    dom::add(&block, &body);
+                }
+            }
+            _ => {
+                dom::add(&block, &dom::el("p", "", &text));
+            }
+        }
+        dom::add(container, &block);
+    }
+    true
+}
+
+fn cache_call_block_if_present(node: &web_sys::Element) {
+    if let Some(call_id) = node.get_attribute("data-call-id") {
+        if !call_id.is_empty() {
+            CALL_BLOCK_CACHE.with(|c| {
+                c.borrow_mut().insert(call_id, node.clone());
+            });
+        }
+    }
+}
+
+pub(crate) fn plan_anonymous_rekeys(
+    events: &[V],
+    resolved_calls: &[Option<String>],
+    prepend_end: usize,
+) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for (idx, ev) in events.iter().enumerate().skip(prepend_end) {
+        if m::text(ev, "kind") != "tool"
+            || starts(ev)
+            || ev["call_id"]
+                .as_str()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .or_else(|| ev["call"].as_str().map(str::trim).filter(|s| !s.is_empty()))
+                .is_some()
+        {
+            continue;
+        }
+        let id = m::string(&ev["id"]);
+        if id.is_empty() {
+            continue;
+        }
+        let fallback = format!("anonymous-{id}");
+        if let Some(resolved) = resolved_calls.get(idx).and_then(|c| c.as_deref()) {
+            if resolved != fallback {
+                out.push((fallback, resolved.to_owned()));
+            }
+        }
+    }
+    out
+}
+
+fn rekey_existing_tool_block(events_el: &web_sys::Element, old_call: &str, new_call: &str) {
+    if let Some(existing) = find_tool_block_by_call_id(events_el, old_call) {
+        let _ = existing.set_attribute("data-call-id", new_call);
+        CALL_BLOCK_CACHE.with(|cache| {
+            let mut cache = cache.borrow_mut();
+            cache.remove(old_call);
+            cache.insert(new_call.to_owned(), existing);
+        });
+    }
+}
+
+fn prepend_events_range(start: usize, end: usize) {
+    let Some(events_el) = dom::get("events") else {
+        return;
+    };
+    if start >= end {
+        return;
+    }
+    let events = m::read(|s| s.events.clone());
+    let end = end.min(events.len());
+    if start >= end {
+        return;
+    }
+    let (_, _, resolved_calls) = fold_run_events_cached(&events);
+    for (old_call, new_call) in plan_anonymous_rekeys(&events, &resolved_calls, end) {
+        rekey_existing_tool_block(&events_el, &old_call, &new_call);
+    }
+    let staging = dom::el("div", "", "");
+    for (idx, ev) in events.iter().enumerate().take(end).skip(start) {
+        let resolved_call = resolved_calls.get(idx).and_then(|c| c.as_deref());
+        record_rendered_event_id(ev);
+        if m::text(ev, "kind") == "tool" {
+            let call_id = conversation_event_call_id(ev, resolved_call);
+            if let Some(existing) = find_tool_block_by_call_id(&events_el, &call_id) {
+                update_existing_tool_block(&existing, ev, resolved_call);
+                continue;
+            }
+        }
+        render_event_into(&staging, ev, resolved_call, false);
+    }
+    let anchor = events_el.first_child();
+    while let Some(node) = staging.first_element_child() {
+        cache_call_block_if_present(&node);
+        let _ = events_el.insert_before(&node, anchor.as_ref());
+    }
+}
+
+pub(crate) fn fold_run_events_with_cache(
+    cache: &mut FoldCache,
+    events: &[V],
+) -> (V, Option<V>, Vec<Option<String>>) {
+    if events.is_empty() {
+        cache.clear_checkpoints_only();
+        return (
+            cache
+                .prefix_run
+                .as_ref()
+                .map(RunState::to_value)
+                .unwrap_or(V::Null),
+            cache.prefix_before.as_deref().cloned(),
+            Vec::new(),
+        );
+    }
+    let first_id = events.first().and_then(stream_event_id);
+    let prefix_valid = match cache.prefix_end_id {
+        Some(pend) => first_id.is_some_and(|id| id > pend),
+        None => true,
+    };
+    if !prefix_valid {
+        cache.prefix_end_id = None;
+        cache.prefix_run = None;
+        cache.prefix_before = None;
+        cache.clear_checkpoints_only();
+    }
+
+    let common = cache
+        .event_sigs
+        .iter()
+        .zip(cache.event_ids.iter())
+        .zip(events.iter())
+        .take_while(|((&sig, &id), ev)| sig == event_fold_sig(ev) && id == stream_event_id(ev))
+        .count();
+    if common == events.len() && cache.event_sigs.len() == events.len() {
+        return (
+            cache.last_run.to_value(),
+            cache.last_before.as_deref().cloned(),
+            cache.resolved_calls.clone(),
+        );
+    }
+    let (resume_idx, mut run, mut before) = if common == cache.event_sigs.len() && common > 0 {
+        (common, cache.last_run.clone(), cache.last_before.clone())
+    } else {
+        let cp_pos = cache
+            .checkpoints
+            .iter()
+            .rposition(|(cp_idx, _, _)| *cp_idx <= common);
+        if let Some(pos) = cp_pos {
+            let (idx, cp_run, cp_before) = cache.checkpoints[pos].clone();
+            cache.event_sigs.truncate(idx);
+            cache.event_ids.truncate(idx);
+            cache.resolved_calls.truncate(idx);
+            cache.checkpoints.truncate(pos + 1);
+            (idx, cp_run, cp_before)
+        } else {
+            cache.event_sigs.clear();
+            cache.event_ids.clear();
+            cache.resolved_calls.clear();
+            cache.checkpoints.clear();
+            (
+                0,
+                cache.prefix_run.clone().unwrap_or_default(),
+                cache.prefix_before.clone(),
+            )
+        }
+    };
+    for (offset, ev) in events[resume_idx..].iter().enumerate() {
+        let idx = resume_idx + offset;
+        let (replaced, resolved_call) = run.apply_event(ev);
+        if let Some(replaced) = replaced {
+            before = Some(replaced);
+        }
+        cache.event_sigs.push(event_fold_sig(ev));
+        cache.event_ids.push(stream_event_id(ev));
+        cache.resolved_calls.push(resolved_call);
+        let applied_len = idx + 1;
+        if applied_len % FOLD_CHECKPOINT_STRIDE == 0 {
+            cache.push_checkpoint(applied_len, &run, &before);
+        }
+    }
+    cache.last_run = run;
+    cache.last_before = before;
+    (
+        cache.last_run.to_value(),
+        cache.last_before.as_deref().cloned(),
+        cache.resolved_calls.clone(),
+    )
+}
+
+fn fold_run_events_cached(events: &[V]) -> (V, Option<V>, Vec<Option<String>>) {
+    let (epoch, sid) = m::read(|s| (s.epoch, s.sid.clone()));
+    FOLD_CACHE.with(|cache| {
+        let mut cache = cache.borrow_mut();
+        cache.sync_session(epoch, &sid);
+        fold_run_events_with_cache(&mut cache, events)
+    })
+}
+
+/// Folds `events` locally into `(run, run_before, resolved_calls)` without per-event global store writes.
+#[allow(dead_code)]
+pub(crate) fn fold_run_events(events: &[V]) -> (V, Option<V>, Vec<Option<String>>) {
+    let mut cache = FoldCache::default();
+    fold_run_events_with_cache(&mut cache, events)
+}
+
+#[derive(Default)]
+struct StreamReplayUiState {
+    open_tools: std::collections::BTreeSet<String>,
+    expanded_outputs: std::collections::BTreeSet<String>,
+    open_thinking: std::collections::BTreeSet<String>,
+}
+
+fn capture_stream_replay_ui_state(container: &web_sys::Element) -> StreamReplayUiState {
+    let mut state = StreamReplayUiState::default();
+    if let Ok(nodes) = container.query_selector_all("details.conversation-tool") {
+        for i in 0..nodes.length() {
+            let Some(el) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            else {
+                continue;
+            };
+            let Some(key) = el
+                .get_attribute("data-output-key")
+                .filter(|k| !k.is_empty())
+            else {
+                continue;
+            };
+            if el.has_attribute("open") {
+                state.open_tools.insert(key.clone());
+            }
+            if el.get_attribute("data-output-expanded").as_deref() == Some("true") {
+                state.expanded_outputs.insert(key);
+            }
+        }
+    }
+    if let Ok(nodes) =
+        container.query_selector_all(".conversation-thinking details.thinking-details[open]")
+    {
+        for i in 0..nodes.length() {
+            let Some(el) = nodes
+                .item(i)
+                .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+            else {
+                continue;
+            };
+            if let Some(id) = el
+                .closest(".conversation-thinking")
+                .ok()
+                .flatten()
+                .and_then(|p| p.get_attribute("data-event-id"))
+                .filter(|id| !id.is_empty())
+            {
+                state.open_thinking.insert(id);
+            }
+        }
+    }
+    state
+}
+
+fn restore_stream_replay_ui_state(container: &web_sys::Element, state: &StreamReplayUiState) {
+    if state.open_tools.is_empty()
+        && state.expanded_outputs.is_empty()
+        && state.open_thinking.is_empty()
+    {
+        return;
+    }
+    if !state.open_tools.is_empty() || !state.expanded_outputs.is_empty() {
+        if let Ok(nodes) = container.query_selector_all("details.conversation-tool") {
+            for i in 0..nodes.length() {
+                let Some(el) = nodes
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                let Some(key) = el
+                    .get_attribute("data-output-key")
+                    .filter(|k| !k.is_empty())
+                else {
+                    continue;
+                };
+                if state.open_tools.contains(&key) {
+                    let _ = el.set_attribute("open", "");
+                }
+                if state.expanded_outputs.contains(&key) {
+                    if let Some(full) =
+                        TOOL_FULL_OUTPUTS.with(|map| map.borrow().get(&key).cloned())
+                    {
+                        let _ = el.set_attribute("data-output-expanded", "true");
+                        apply_tool_output_dom(&el, &key, &full);
+                    } else {
+                        mark_tool_output_evicted(&el);
+                    }
+                }
+            }
+        }
+    }
+    if !state.open_thinking.is_empty() {
+        if let Ok(nodes) = container
+            .query_selector_all(".conversation-thinking[data-event-id] details.thinking-details")
+        {
+            for i in 0..nodes.length() {
+                let Some(el) = nodes
+                    .item(i)
+                    .and_then(|n| n.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                let matched = el
+                    .closest(".conversation-thinking")
+                    .ok()
+                    .flatten()
+                    .and_then(|p| p.get_attribute("data-event-id"))
+                    .is_some_and(|id| state.open_thinking.contains(&id));
+                if matched {
+                    let _ = el.set_attribute("open", "");
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RenderedBlockMeta {
+    pub(crate) first_id: u64,
+    pub(crate) last_id: u64,
+    pub(crate) call_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum IncrementalOp {
+    InsertBefore {
+        event_idx: usize,
+        before_block_idx: usize,
+    },
+    UpdateTool {
+        event_idx: usize,
+        block_idx: usize,
+    },
+    AppendBottom {
+        event_idx: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ReplayPlan {
+    Incremental {
+        ops: Vec<IncrementalOp>,
+        bottom_appended: usize,
+        inserted_above: bool,
+    },
+    FullRebuild {
+        bottom_appended: usize,
+    },
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn plan_stream_replay(
+    blocks: &[RenderedBlockMeta],
+    rendered_ids: &BTreeSet<u64>,
+    max_rendered_id: Option<u64>,
+    visible_events: &[V],
+) -> ReplayPlan {
+    plan_stream_replay_with_calls(blocks, rendered_ids, max_rendered_id, visible_events, &[])
+}
+
+pub(crate) fn plan_stream_replay_with_calls(
+    blocks: &[RenderedBlockMeta],
+    rendered_ids: &BTreeSet<u64>,
+    max_rendered_id: Option<u64>,
+    visible_events: &[V],
+    resolved_calls: &[Option<String>],
+) -> ReplayPlan {
+    let count_bottom_new = || -> usize {
+        if let Some(max_id) = max_rendered_id {
+            visible_events
+                .iter()
+                .filter_map(stream_event_id)
+                .filter(|id| !rendered_ids.contains(id) && *id > max_id)
+                .count()
+        } else {
+            visible_events.len()
+        }
+    };
+
+    if blocks.is_empty() || visible_events.is_empty() || rendered_ids.is_empty() {
+        return ReplayPlan::FullRebuild {
+            bottom_appended: count_bottom_new(),
+        };
+    }
+
+    let mut ops = Vec::new();
+    let mut bottom_appended = 0usize;
+    let mut inserted_above = false;
+    for (idx, ev) in visible_events.iter().enumerate() {
+        let Some(ev_id) = stream_event_id(ev) else {
+            return ReplayPlan::FullRebuild {
+                bottom_appended: count_bottom_new(),
+            };
+        };
+        if rendered_ids.contains(&ev_id) {
+            continue;
+        }
+        let kind = m::text(ev, "kind");
+        if kind == "tool" {
+            let resolved = resolved_calls.get(idx).and_then(|c| c.as_deref());
+            let call_id = conversation_event_call_id(ev, resolved);
+            if !call_id.is_empty() {
+                if let Some(block_idx) = blocks.iter().position(|b| b.call_id == call_id) {
+                    ops.push(IncrementalOp::UpdateTool {
+                        event_idx: idx,
+                        block_idx,
+                    });
+                    continue;
+                }
+            }
+        }
+        if max_rendered_id.is_some_and(|m| ev_id > m) {
+            bottom_appended += 1;
+            ops.push(IncrementalOp::AppendBottom { event_idx: idx });
+            continue;
+        }
+        let before_pos = blocks.iter().position(|b| b.first_id > ev_id);
+        let splits_coalesced = match before_pos {
+            Some(0) => false,
+            Some(pos) => {
+                let prev = &blocks[pos - 1];
+                prev.first_id < ev_id && ev_id < prev.last_id
+            }
+            None => blocks
+                .last()
+                .is_some_and(|last| last.first_id < ev_id && ev_id < last.last_id),
+        };
+        if splits_coalesced {
+            return ReplayPlan::FullRebuild {
+                bottom_appended: count_bottom_new(),
+            };
+        }
+        if let Some(before_block_idx) = before_pos {
+            inserted_above = true;
+            ops.push(IncrementalOp::InsertBefore {
+                event_idx: idx,
+                before_block_idx,
+            });
+        } else {
+            // Event follows all rendered blocks even if <= max_rendered_id (e.g., trailing non-rendered item).
+            ops.push(IncrementalOp::AppendBottom { event_idx: idx });
+        }
+    }
+
+    ReplayPlan::Incremental {
+        ops,
+        bottom_appended,
+        inserted_above,
+    }
+}
+
+pub(crate) fn extract_rendered_block_metas<'a>(
+    entries: impl IntoIterator<Item = (Option<&'a str>, Option<&'a str>, Option<&'a str>)>,
+) -> Vec<(usize, RenderedBlockMeta)> {
+    let mut out = Vec::new();
+    for (idx, (event_id_attr, first_id_attr, call_id_attr)) in entries.into_iter().enumerate() {
+        let Some(last_id) = event_id_attr.and_then(|s| s.trim().parse::<u64>().ok()) else {
+            continue;
+        };
+        let first_id = first_id_attr
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(last_id);
+        let call_id = call_id_attr.unwrap_or_default().to_owned();
+        out.push((
+            idx,
+            RenderedBlockMeta {
+                first_id,
+                last_id,
+                call_id,
+            },
+        ));
+    }
+    out
+}
+
+fn read_rendered_blocks(
+    container: &web_sys::Element,
+) -> Option<(Vec<web_sys::Element>, Vec<RenderedBlockMeta>)> {
+    let dom_nodes = dom::children(container);
+    let attrs: Vec<(Option<String>, Option<String>, Option<String>)> = dom_nodes
+        .iter()
+        .map(|el| {
+            (
+                el.get_attribute("data-event-id"),
+                el.get_attribute("data-first-event-id"),
+                el.get_attribute("data-call-id"),
+            )
+        })
+        .collect();
+    // Skip permission / status cards lacking numeric `data-event-id` so `#events` stays incremental.
+    let extracted =
+        extract_rendered_block_metas(attrs.iter().map(|(event_id, first_id, call_id)| {
+            (event_id.as_deref(), first_id.as_deref(), call_id.as_deref())
+        }));
+    let tracked_nodes = extracted
+        .iter()
+        .map(|(idx, _)| dom_nodes[*idx].clone())
+        .collect();
+    let metas = extracted.into_iter().map(|(_, meta)| meta).collect();
+    Some((tracked_nodes, metas))
+}
+
+pub(crate) fn decide_existing_tool_update(
+    existing_id: Option<u64>,
+    incoming_id: Option<u64>,
+) -> bool {
+    match (existing_id, incoming_id) {
+        (Some(cur), Some(inc)) => inc >= cur,
+        _ => true,
+    }
+}
+
+fn update_existing_tool_block(block: &web_sys::Element, v: &V, resolved_call: Option<&str>) {
+    let id = m::string(&v["id"]);
+    let call_id = conversation_event_call_id(v, resolved_call);
+    let existing_id = block
+        .get_attribute("data-event-id")
+        .and_then(|s| s.trim().parse::<u64>().ok());
+    let incoming_id = stream_event_id(v);
+    if let Some(inc) = incoming_id {
+        let first_id = block
+            .get_attribute("data-first-event-id")
+            .and_then(|s| s.trim().parse::<u64>().ok());
+        if first_id.is_none_or(|cur| inc < cur) {
+            let _ = block.set_attribute("data-first-event-id", &id);
+        }
+    }
+    if !decide_existing_tool_update(existing_id, incoming_id) {
+        return;
+    }
+    let is_start = starts(v);
+    let failed = !is_start && v["ok"] == false;
+    let state_str = if is_start {
+        "running"
+    } else if failed {
+        "failed"
+    } else {
+        "completed"
+    };
+    let _ = block.set_attribute("data-event-id", &id);
+    let _ = block.set_attribute("data-tool-state", state_str);
+    if let Ok(Some(summary)) = block.query_selector("summary") {
+        summary.set_text_content(Some(&format_tool_summary(v)));
+    }
+    let output_key = if !call_id.is_empty() {
+        call_id
+    } else {
+        format!("ev:{id}")
+    };
+    let _ = block.set_attribute("data-output-key", &output_key);
+    let text = clean(&m::text(v, "text"));
+    let full_text = store_tool_output(&output_key, &text, is_start);
+    apply_tool_output_dom(block, &output_key, &full_text);
+    sync_tool_failure_button(block, v, &full_text, failed);
+}
+
+/// Re-renders `#events` from `model::events` honoring the current `visible_limit` window
+/// while folding `run` locally and preserving expanded tool/thinking state and cached full outputs.
+pub(crate) fn replay_visible_stream() {
+    let events_el = dom::get("events");
+    let conv_before = dom::get("conversation").map(|c| {
+        let sticky = m::read(|s| s.stream.sticky_bottom)
+            || is_near_bottom(c.scroll_height(), c.scroll_top(), c.client_height());
+        (sticky, c.scroll_top(), c.scroll_height())
+    });
+    let was_sticky = conv_before.map(|(s, _, _)| s).unwrap_or(true);
+    let prev_scroll_top = conv_before.map(|(_, top, _)| top).unwrap_or(0);
+    let prev_scroll_height = conv_before.map(|(_, _, h)| h).unwrap_or(0);
+
+    let (events, limit) = m::read(|s| (s.events.clone(), s.stream.visible_limit));
+    let start = events.len().saturating_sub(limit);
+    let (next_run, next_before, resolved_calls) = fold_run_events_cached(&events);
+    if events.is_empty() {
+        m::take("run");
+        m::take("run-before");
+    } else {
+        m::set("run", next_run);
+        if let Some(before) = next_before {
+            m::set("run-before", before);
+        } else {
+            m::take("run-before");
+        }
+    }
+
+    let visible_events = &events[start..];
+    let visible_resolved_calls = &resolved_calls[start..];
+    let dom_snapshot = events_el.as_ref().and_then(read_rendered_blocks);
+    let plan = match &dom_snapshot {
+        Some((_, metas)) => RENDERED_EVENT_IDS.with(|ids| {
+            let max_id = LAST_MAX_RENDERED_ID.with(Cell::get);
+            plan_stream_replay_with_calls(
+                metas,
+                &ids.borrow(),
+                max_id,
+                visible_events,
+                visible_resolved_calls,
+            )
+        }),
+        None => RENDERED_EVENT_IDS.with(|ids| {
+            let max_id = LAST_MAX_RENDERED_ID.with(Cell::get);
+            plan_stream_replay_with_calls(
+                &[],
+                &ids.borrow(),
+                max_id,
+                visible_events,
+                visible_resolved_calls,
+            )
+        }),
+    };
+
+    if let (
+        Some(container),
+        Some((dom_nodes, _)),
+        ReplayPlan::Incremental {
+            ops,
+            bottom_appended,
+            inserted_above,
+        },
+    ) = (&events_el, &dom_snapshot, &plan)
+    {
+        let mut rendered_any = false;
+        for op in ops {
+            match *op {
+                IncrementalOp::InsertBefore {
+                    event_idx,
+                    before_block_idx,
+                } => {
+                    let ev = &visible_events[event_idx];
+                    let resolved_call = resolved_calls[start + event_idx].as_deref();
+                    activity(ev);
+                    record_rendered_event_id(ev);
+                    let staging = dom::el("div", "", "");
+                    if render_event_into(&staging, ev, resolved_call, true) {
+                        let anchor = dom_nodes.get(before_block_idx);
+                        while let Some(node) = staging.first_element_child() {
+                            cache_call_block_if_present(&node);
+                            let _ = container.insert_before(&node, anchor.map(|a| a.as_ref()));
+                            rendered_any = true;
+                        }
+                    }
+                }
+                IncrementalOp::UpdateTool {
+                    event_idx,
+                    block_idx,
+                } => {
+                    let ev = &visible_events[event_idx];
+                    let resolved_call = resolved_calls[start + event_idx].as_deref();
+                    activity(ev);
+                    record_rendered_event_id(ev);
+                    if let Some(block) = dom_nodes.get(block_idx) {
+                        update_existing_tool_block(block, ev, resolved_call);
+                        rendered_any = true;
+                    }
+                }
+                IncrementalOp::AppendBottom { event_idx } => {
+                    let ev = &visible_events[event_idx];
+                    let resolved_call = resolved_calls[start + event_idx].as_deref();
+                    activity(ev);
+                    record_rendered_event_id(ev);
+                    if render_event_into(container, ev, resolved_call, true) {
+                        rendered_any = true;
+                    }
+                }
+            }
+        }
+        if rendered_any {
+            let conv = dom::get("conversation");
+            evict_excess_top_dom_nodes(
+                container,
+                dom_block_cap(was_sticky),
+                conv.as_ref(),
+                was_sticky,
+            );
+            if let Some(conv) = conv {
+                if was_sticky {
+                    conv.set_scroll_top(conv.scroll_height());
+                    m::write(|s| {
+                        s.stream.sticky_bottom = true;
+                        s.stream.unseen_count = 0;
+                    });
+                } else {
+                    let target_top = if *inserted_above && *bottom_appended == 0 {
+                        let new_h = conv.scroll_height();
+                        prev_scroll_top + (new_h - prev_scroll_height)
+                    } else {
+                        prev_scroll_top
+                    };
+                    conv.set_scroll_top(target_top);
+                    m::write(|s| {
+                        s.stream.sticky_bottom = false;
+                        if *bottom_appended > 0 {
+                            s.stream.unseen_count =
+                                s.stream.unseen_count.saturating_add(*bottom_appended);
+                        }
+                    });
+                }
+                update_scroll_ui();
+            }
+        }
+        prune_state_events_to_cap();
+        sync_load_earlier_control();
+        return;
+    }
+
+    let bottom_appended = match plan {
+        ReplayPlan::FullRebuild { bottom_appended } => bottom_appended,
+        ReplayPlan::Incremental {
+            bottom_appended, ..
+        } => bottom_appended,
+    };
+
+    let preserved = events_el
+        .as_ref()
+        .map(capture_stream_replay_ui_state)
+        .unwrap_or_default();
+
+    clear_stream_dom_caches();
+    dom::clear("events");
+    m::take("agents");
+    let mut rendered_any = false;
+    for (idx, (ev, resolved_call)) in events.iter().zip(resolved_calls.iter()).enumerate() {
+        activity(ev);
+        if idx >= start {
+            record_rendered_event_id(ev);
+            if let Some(ref container) = events_el {
+                if render_event_into(container, ev, resolved_call.as_deref(), true) {
+                    rendered_any = true;
+                }
+            }
+        }
+    }
+    if let Some(ref container) = events_el {
+        restore_stream_replay_ui_state(container, &preserved);
+        evict_excess_top_dom_nodes(
+            container,
+            dom_block_cap(was_sticky),
+            dom::get("conversation").as_ref(),
+            was_sticky,
+        );
+    }
+    prune_state_events_to_cap();
+    if rendered_any {
+        if let Some(conv) = dom::get("conversation") {
+            if was_sticky {
+                conv.set_scroll_top(conv.scroll_height());
+                m::write(|s| {
+                    s.stream.sticky_bottom = true;
+                    s.stream.unseen_count = 0;
+                });
+            } else {
+                conv.set_scroll_top(prev_scroll_top);
+                m::write(|s| {
+                    s.stream.sticky_bottom = false;
+                    if bottom_appended > 0 {
+                        s.stream.unseen_count =
+                            s.stream.unseen_count.saturating_add(bottom_appended);
+                    }
+                });
+            }
+        }
+        update_scroll_ui();
+    }
+    sync_load_earlier_control();
+}
+
+pub(crate) async fn load_earlier_events() {
+    let (sid, has_older, oldest_id, events, limit, loading) = m::read(|s| {
+        (
+            s.sid.clone(),
+            s.stream.has_older,
+            s.stream.oldest_event_id,
+            s.events.clone(),
+            s.stream.visible_limit,
+            s.stream.loading_older,
+        )
+    });
+    if loading || sid.is_empty() {
+        return;
+    }
+    let total = events.len();
+    let prev_metrics = dom::get("conversation").map(|c| (c.scroll_height(), c.scroll_top()));
+    let first_rendered_id = if cfg!(target_arch = "wasm32") {
+        earliest_rendered_dom_event_id()
+    } else {
+        None
+    };
+    let client_hidden = compute_client_hidden_prefix(&events, limit, first_rendered_id);
+    if client_hidden > 0 {
+        let old_start = client_hidden;
+        let new_start = old_start.saturating_sub(120);
+        m::write(|s| {
+            s.stream.visible_limit = s.stream.visible_limit.max(total.saturating_sub(new_start));
+        });
+        prepend_events_range(new_start, old_start);
+        sync_load_earlier_control();
+        if let (Some((prev_h, prev_top)), Some(conv)) = (prev_metrics, dom::get("conversation")) {
+            let new_h = conv.scroll_height();
+            conv.set_scroll_top(prev_top + (new_h - prev_h));
+        }
+        return;
+    }
+    if !has_older {
+        sync_load_earlier_control();
+        return;
+    }
+    let Some(before) = oldest_id else {
+        m::write(|s| s.stream.has_older = false);
+        sync_load_earlier_control();
+        return;
+    };
+    m::write(|s| s.stream.loading_older = true);
+    sync_load_earlier_control();
+    let epoch = m::read(|s| s.epoch);
+    let url = format!("/api/sessions/{}?before={before}&limit=250", dom::enc(&sid));
+    let res = crate::api::get(&url).await;
+    m::write(|s| s.stream.loading_older = false);
+    if m::read(|s| s.sid != sid || s.epoch != epoch) {
+        return;
+    }
+    match res {
+        Ok(v) => {
+            dom::error("events-error", "");
+            let older = m::array(&v["events"]);
+            let (new_start, old_start_after) = m::write(|s| {
+                let prev_total = s.events.len();
+                let prev_old_start = prev_total.saturating_sub(s.stream.visible_limit);
+                let mut merged = Vec::with_capacity(older.len() + prev_total);
+                for item in &older {
+                    let id = m::string(&item["id"]);
+                    if id.is_empty() || s.seen.insert(id) {
+                        merged.push(item.clone());
+                    }
+                }
+                let added_len = merged.len();
+                s.stream.visible_limit = s.stream.visible_limit.saturating_add(added_len.max(120));
+                merged.append(&mut s.events);
+                s.events = merged;
+                s.stream.has_older = v["has_older"].as_bool().unwrap_or(false);
+                s.stream.oldest_event_id =
+                    v["oldest_event_id"].as_u64().or(s.stream.oldest_event_id);
+                let total_after = s.events.len();
+                let new_start = total_after.saturating_sub(s.stream.visible_limit);
+                let old_start_after = added_len + prev_old_start;
+                (new_start, old_start_after)
+            });
+            prepend_events_range(new_start, old_start_after);
+            if let (Some((prev_h, prev_top)), Some(conv)) = (prev_metrics, dom::get("conversation"))
+            {
+                let new_h = conv.scroll_height();
+                conv.set_scroll_top(prev_top + (new_h - prev_h));
+            }
+        }
+        Err(e) if !e.aborted => {
+            dom::error("events-error", &e.message);
+        }
+        Err(_) => {}
+    }
+    sync_load_earlier_control();
+}
+
+pub(crate) async fn copy_code_block(target: &web_sys::Element) {
+    let Some(wrapper) = target.closest(".md-code-block").ok().flatten() else {
+        return;
+    };
+    let Some(code_el) = wrapper.query_selector("pre code").ok().flatten() else {
+        return;
+    };
+    let code = code_el.text_content().unwrap_or_default();
+    let copying = dom::window().navigator().clipboard().write_text(&code);
+    let ok = wasm_bindgen_futures::JsFuture::from(copying).await.is_ok();
+    target.set_text_content(Some(if ok { "Copied" } else { "Copy failed" }));
+    let copy_id = match target
+        .get_attribute("data-copy-id")
+        .filter(|s| !s.is_empty())
+    {
+        Some(id) => id,
+        None => {
+            let seq = NEXT_COPY_SEQ.with(|c| {
+                let n = c.get();
+                c.set(n.saturating_add(1));
+                n
+            });
+            let id = seq.to_string();
+            let _ = target.set_attribute("data-copy-id", &id);
+            id
+        }
+    };
+    let timer_key = copy_timer_key(Some(&copy_id), 0);
+    let btn = target.clone();
+    dom::later(&timer_key, 1500, move || {
+        btn.set_text_content(Some("Copy"));
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tool_output_budget_evicts_oldest_entries_by_byte_and_key_cap() {
+        let mut map = BTreeMap::new();
+        let mut order = VecDeque::new();
+        for (k, size) in [("c1", 6), ("c2", 6), ("c3", 6)] {
+            map.insert(k.to_owned(), "x".repeat(size));
+            touch_tool_output_key(&mut order, k);
+            prune_tool_outputs_with_budget(&mut map, &mut order, 256, 12);
+        }
+        // 18 bytes > 12 byte cap -> oldest entry c1 evicted, c2 + c3 (12 bytes) retained.
+        assert!(!map.contains_key("c1"));
+        assert!(map.contains_key("c2"));
+        assert!(map.contains_key("c3"));
+
+        // Touching c2 makes it MRU so inserting c4 evicts c3 instead of c2.
+        touch_tool_output_key(&mut order, "c2");
+        map.insert("c4".to_owned(), "x".repeat(6));
+        touch_tool_output_key(&mut order, "c4");
+        prune_tool_outputs_with_budget(&mut map, &mut order, 256, 12);
+        assert!(map.contains_key("c2"));
+        assert!(!map.contains_key("c3"));
+        assert!(map.contains_key("c4"));
+    }
+
+    #[test]
+    fn incremental_replay_plans_insert_before_without_bumping_unseen_and_falls_back_on_split() {
+        let blocks = vec![
+            RenderedBlockMeta {
+                first_id: 10,
+                last_id: 11,
+                call_id: String::new(),
+            },
+            RenderedBlockMeta {
+                first_id: 20,
+                last_id: 20,
+                call_id: "call-20".into(),
+            },
+        ];
+        let rendered_ids = BTreeSet::from([10, 11, 20]);
+
+        // Out-of-order earlier event (15) goes before block 1 (id 20), bottom_appended == 0.
+        let visible_insert = vec![
+            json!({"id": 10, "kind": "text", "text": "a"}),
+            json!({"id": 11, "kind": "text", "text": "b"}),
+            json!({"id": 15, "kind": "status", "text": "older"}),
+            json!({"id": 20, "kind": "tool", "call": "call-20", "state": "started"}),
+        ];
+        assert_eq!(
+            plan_stream_replay(&blocks, &rendered_ids, Some(20), &visible_insert),
+            ReplayPlan::Incremental {
+                ops: vec![IncrementalOp::InsertBefore {
+                    event_idx: 2,
+                    before_block_idx: 1,
+                }],
+                bottom_appended: 0,
+                inserted_above: true,
+            }
+        );
+
+        // New bottom-appended event (25) alongside out-of-order (15) bumps bottom_appended == 1.
+        let visible_mixed = vec![
+            json!({"id": 10, "kind": "text", "text": "a"}),
+            json!({"id": 11, "kind": "text", "text": "b"}),
+            json!({"id": 15, "kind": "status", "text": "older"}),
+            json!({"id": 20, "kind": "tool", "call": "call-20", "state": "started"}),
+            json!({"id": 25, "kind": "text", "text": "latest"}),
+        ];
+        assert_eq!(
+            plan_stream_replay(&blocks, &rendered_ids, Some(20), &visible_mixed),
+            ReplayPlan::Incremental {
+                ops: vec![
+                    IncrementalOp::InsertBefore {
+                        event_idx: 2,
+                        before_block_idx: 1,
+                    },
+                    IncrementalOp::AppendBottom { event_idx: 4 },
+                ],
+                bottom_appended: 1,
+                inserted_above: true,
+            }
+        );
+
+        // Coalesced block split (10..12 already coalesced, 11 arrives late) falls back cleanly to FullRebuild.
+        let coalesced_blocks = vec![RenderedBlockMeta {
+            first_id: 10,
+            last_id: 12,
+            call_id: String::new(),
+        }];
+        let coalesced_ids = BTreeSet::from([10, 12]);
+        let visible_split = vec![
+            json!({"id": 10, "kind": "text", "text": "a"}),
+            json!({"id": 11, "kind": "status", "text": "split"}),
+            json!({"id": 12, "kind": "text", "text": "b"}),
+        ];
+        assert_eq!(
+            plan_stream_replay(&coalesced_blocks, &coalesced_ids, Some(12), &visible_split),
+            ReplayPlan::FullRebuild { bottom_appended: 0 }
+        );
+    }
+
+    #[test]
+    fn incremental_replay_survives_non_numeric_cards_and_uses_resolved_calls() {
+        let metas = extract_rendered_block_metas([
+            (Some("10"), None, Some("call-10")),
+            (None, None, None),
+            (Some("perm-card"), None, None),
+            (Some("12"), Some("11"), None),
+        ]);
+        assert_eq!(metas.len(), 2);
+        assert_eq!(metas[0].0, 0);
+        assert_eq!(metas[0].1.last_id, 10);
+        assert_eq!(metas[0].1.call_id, "call-10");
+        assert_eq!(metas[1].0, 3);
+        assert_eq!(metas[1].1.first_id, 11);
+        assert_eq!(metas[1].1.last_id, 12);
+
+        let blocks: Vec<_> = metas.into_iter().map(|(_, m)| m).collect();
+        let rendered_ids = BTreeSet::from([10, 11, 12]);
+        let visible = vec![
+            json!({"id": 10, "kind": "tool", "call": "call-10", "state": "started"}),
+            json!({"id": 11, "kind": "text", "text": "a"}),
+            json!({"id": 12, "kind": "text", "text": "b"}),
+            json!({"id": 13, "kind": "tool", "text": "done"}),
+            json!({"id": 14, "kind": "text", "text": "next"}),
+        ];
+        let resolved_calls = vec![
+            Some("call-10".to_owned()),
+            None,
+            None,
+            Some("call-10".to_owned()),
+            None,
+        ];
+        assert_eq!(
+            plan_stream_replay_with_calls(
+                &blocks,
+                &rendered_ids,
+                Some(12),
+                &visible,
+                &resolved_calls,
+            ),
+            ReplayPlan::Incremental {
+                ops: vec![
+                    IncrementalOp::UpdateTool {
+                        event_idx: 3,
+                        block_idx: 0,
+                    },
+                    IncrementalOp::AppendBottom { event_idx: 4 },
+                ],
+                bottom_appended: 1,
+                inserted_above: false,
+            }
+        );
+    }
+
+    #[test]
+    fn incremental_fold_cache_matches_full_fold_on_append_mutation_and_eviction_updates() {
+        let mut events = Vec::new();
+        for i in 1..=140u64 {
+            if i % 2 == 1 {
+                events.push(json!({
+                    "id": i,
+                    "kind": "tool",
+                    "tool": "Bash",
+                    "call": format!("c-{i}"),
+                    "state": "started"
+                }));
+            } else {
+                events.push(json!({
+                    "id": i,
+                    "kind": "tool",
+                    "ok": true,
+                    "text": format!("ok {i}")
+                }));
+            }
+        }
+        let mut cache = FoldCache::default();
+        let first = fold_run_events_with_cache(&mut cache, &events);
+        let expected_first = fold_run_events(&events);
+        assert_eq!(first, expected_first);
+
+        // Append delta reuses strided checkpoint.
+        events.push(json!({"id": 141, "kind": "text", "text": "tail"}));
+        let appended = fold_run_events_with_cache(&mut cache, &events);
+        assert_eq!(appended, fold_run_events(&events));
+
+        // Middle update invalidates from nearest prior stride checkpoint and still matches.
+        events[70] = json!({"id": 71, "kind": "tool", "call": "c-edited", "state": "started"});
+        let edited = fold_run_events_with_cache(&mut cache, &events);
+        assert_eq!(edited, fold_run_events(&events));
+
+        // Top DOM eviction preserves non-evictable pending permission cards and updates client_hidden
+        // plus clamps visible_limit so subsequent replays never thrash on evicted prefix events.
+        let evict_indices = plan_top_dom_eviction(&[false, true, true, true, true], 3);
+        assert_eq!(evict_indices, vec![1, 2]);
+        assert_eq!(
+            compute_client_hidden_prefix(&events, 120, Some(50)),
+            49,
+            "client_hidden follows earliest rendered event id after top DOM eviction"
+        );
+        let clamped = clamped_visible_limit_after_eviction(&events, 141, &[(1, 100)]);
+        assert_eq!(clamped, 41);
+        let post_evict_start = events.len().saturating_sub(clamped);
+        assert_eq!(post_evict_start, 100);
+        let suffix_blocks: Vec<RenderedBlockMeta> = events[post_evict_start..]
+            .iter()
+            .map(|ev| {
+                let id = stream_event_id(ev).unwrap();
+                RenderedBlockMeta {
+                    first_id: id,
+                    last_id: id,
+                    call_id: conversation_event_call_id(ev, None),
+                }
+            })
+            .collect();
+        let suffix_ids: BTreeSet<u64> = events[post_evict_start..]
+            .iter()
+            .filter_map(stream_event_id)
+            .collect();
+        assert_eq!(
+            plan_stream_replay_with_calls(
+                &suffix_blocks,
+                &suffix_ids,
+                Some(141),
+                &events[post_evict_start..],
+                &[],
+            ),
+            ReplayPlan::Incremental {
+                ops: Vec::new(),
+                bottom_appended: 0,
+                inserted_above: false,
+            }
+        );
+
+        // Evicted tool output keys are returned cleanly and expose an explicit notice.
+        let mut map = BTreeMap::from([
+            ("k1".to_owned(), "aaaaaa".to_owned()),
+            ("k2".to_owned(), "bbbbbb".to_owned()),
+        ]);
+        let mut order = VecDeque::from(["k1".to_owned(), "k2".to_owned()]);
+        let evicted = prune_tool_outputs_with_budget(&mut map, &mut order, 1, 100);
+        assert_eq!(evicted, vec!["k1".to_owned()]);
+        assert!(evicted_tool_output_label().contains("Evicted"));
+
+        // Init stream markdown splits settled prefix cleanly before parsing.
+        let md = "Paragraph one.\n\n```rust\nlet x = 1;\n```\n\nTrailing live";
+        let (init_html, init_entry) = build_init_stream_markdown(md);
+        assert!(init_entry.settled_bytes > 0 && init_entry.settled_bytes < md.len());
+        assert!(init_entry.settled_dom_blocks >= 2);
+        assert!(!init_entry.tail_blocks.is_empty());
+        assert_eq!(init_html, render_assistant_markdown_html(md));
+
+        // Backtick info strings stay aligned with `render_markdown_html` (no mid-fence split on `\n\n`).
+        let backtick_info = "Intro.\n\n```rust `inline`\nlet a = 1;\n\nlet b = 2;\n```\n\nAfter";
+        let settled_bt = find_settled_markdown_boundary(backtick_info, 0);
+        assert_eq!(
+            &backtick_info[..settled_bt],
+            "Intro.\n\n```rust `inline`\nlet a = 1;\n\nlet b = 2;\n```\n\n"
+        );
+        let (bt_html, _) = build_init_stream_markdown(backtick_info);
+        assert_eq!(bt_html, render_assistant_markdown_html(backtick_info));
+
+        // Anonymous un-keyed completion rendered initially as `anonymous-510` is planned for
+        // re-keying to `anonymous-490` when `?before=` prepends its start (`id=490`).
+        let anon_events = vec![
+            json!({"id": 490, "kind": "tool", "tool": "Bash", "state": "started"}),
+            json!({"id": 510, "kind": "tool", "tool": "Bash", "state": "completed", "ok": true, "text": "done"}),
+        ];
+        let (_, _, anon_calls) = fold_run_events(&anon_events);
+        assert_eq!(
+            plan_anonymous_rekeys(&anon_events, &anon_calls, 1),
+            vec![("anonymous-510".to_owned(), "anonymous-490".to_owned())]
+        );
+        // When a later completed block absorbs an earlier prepended `started` event (`192`),
+        // folding min rendered ID returns `192` instead of trapping `client_hidden > 0`.
+        let min_rendered = [Some(193), Some(201), Some(192)]
+            .into_iter()
+            .fold(None, fold_min_rendered_event_id);
+        assert_eq!(min_rendered, Some(192));
+
+        // Cross-page ?before= tool dedup never downgrades a newer completed block to older running.
+        assert!(!decide_existing_tool_update(Some(205), Some(195)));
+        assert!(decide_existing_tool_update(Some(195), Some(205)));
+        assert!(decide_existing_tool_update(Some(205), Some(205)));
+
+        // Pruning old events past STATE_EVENTS_HARD_CAP advances FoldCache prefix and matches full fold.
+        assert_eq!(plan_state_events_prune_count(&events, 141, None), 0);
+        assert_eq!(plan_state_events_prune_count(&events, 100, Some(25)), 24);
+        assert_eq!(plan_state_events_prune_count(&events, 100, None), 41);
+
+        let full_expected = fold_run_events(&events);
+        let mut pruned_cache = FoldCache::default();
+        pruned_cache.sync_session(7, "s-prune");
+        let _ = fold_run_events_with_cache(&mut pruned_cache, &events);
+        let drained = events[..41].to_vec();
+        let remaining = events[41..].to_vec();
+        pruned_cache.advance_pruned_prefix(&drained);
+        let after_prune = fold_run_events_with_cache(&mut pruned_cache, &remaining);
+        assert_eq!(after_prune.0, full_expected.0);
+        assert_eq!(after_prune.1, full_expected.1);
+        assert_eq!(after_prune.2, full_expected.2[41..].to_vec());
+    }
+}

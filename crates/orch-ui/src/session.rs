@@ -1,41 +1,501 @@
-use crate::{api, dom, inbox, management, model as m, run, systems};
+use crate::{
+    api, commands, dom, inbox, management, model as m, omnigraph, run, systems,
+};
 use serde_json::{json, Value as V};
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use wasm_bindgen::{prelude::*, JsCast};
 use wasm_bindgen_futures::{spawn_local, JsFuture};
-thread_local! {static FILES:RefCell<Vec<web_sys::File>>=const { RefCell::new(Vec::new()) };}
-const PREFS: &str = "harness.sessions.preferences.v1";
-/// Characters a context draft may hold when its response names no bound.
-const TASK_CONTEXT_LIMIT: usize = 6000;
-const TASK_CONTEXT_ATTACHED: &str =
-    "Context from this task is already attached. Remove it to attach a new version.";
-const PREF_FIELDS: &[&str] = &[
-    "provider",
-    "workflow",
-    "mode",
-    "agents-enabled",
-    "agent-count",
-    "workspace",
-    "existing-worktree",
-    "worktree-branch",
-    "sdd-feature",
-    "sdd-phase",
-    "clash-enabled",
-    "clash-challenger",
-    "clash-rounds",
-    "fleet-dry-run",
-    "fleet-budget",
-    "fleet-worker-timeout",
-    "brain-link-kind",
-    "brain-link-review",
-    "brain-link-task-id",
-    "brain-link-goal",
-    "brain-link-query",
-    "model-choice",
-    "model",
-    "thinking-effort",
-];
+
+mod advisory;
+mod composer;
+mod navigation;
+mod poll;
+mod prefs;
+mod results;
+#[cfg(test)]
+mod tests;
+
+pub(crate) use advisory::*;
+pub use composer::*;
+pub use navigation::*;
+pub use poll::*;
+pub use prefs::*;
+pub use results::*;
+
+thread_local! {
+    pub(super) static FILES: RefCell<Vec<web_sys::File>> = const { RefCell::new(Vec::new()) };
+    static CAPTURED_GRAPH_CLICK: RefCell<Option<CapturedGraphClick>> = const { RefCell::new(None) };
+    static LAST_MOBILE_VIEWPORT: Cell<Option<bool>> = const { Cell::new(None) };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ViewportSyncPlan {
+    pub(super) close_sidebar: bool,
+    pub(super) sync_inert: bool,
+    pub(super) sync_graph: bool,
+}
+
+pub(super) fn plan_responsive_viewport(
+    last_mobile: &mut Option<bool>,
+    mobile: bool,
+    in_sessions_view: bool,
+) -> ViewportSyncPlan {
+    let prev = *last_mobile;
+    *last_mobile = Some(mobile);
+    if prev == Some(mobile) {
+        return ViewportSyncPlan {
+            close_sidebar: false,
+            sync_inert: false,
+            sync_graph: false,
+        };
+    }
+    ViewportSyncPlan {
+        close_sidebar: !mobile,
+        sync_inert: true,
+        sync_graph: in_sessions_view,
+    }
+}
+
+/// Synchronizes mobile sidebar visibility, overlay `inert` attributes, and the embedded
+/// code graph when the viewport crosses the mobile breakpoint.
+pub(super) fn sync_responsive_viewport() {
+    let mobile = dom::is_mobile_viewport();
+    let in_sessions_view = m::read(|s| s.view == "sessions");
+    let plan = LAST_MOBILE_VIEWPORT.with(|cell| {
+        let mut last = cell.get();
+        let plan = plan_responsive_viewport(&mut last, mobile, in_sessions_view);
+        cell.set(last);
+        plan
+    });
+    let sidebar_open = m::read(|s| s.workspace.sidebar_open)
+        || dom::get("sidebar").is_some_and(|e| e.class_list().contains("open"));
+    if plan.close_sidebar || (!mobile && sidebar_open) {
+        set_sidebar_open(false, false);
+    }
+    let stray_desktop_inert =
+        !mobile && dom::get("sidebar").is_some_and(|e| e.has_attribute("inert"));
+    if plan.sync_inert || stray_desktop_inert {
+        dom::sync_overlay_inert();
+    }
+    if plan.sync_graph {
+        crate::graph_map::sync_embedded(false);
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(super) struct ClickAttrs {
+    resolved_id: String,
+    resolved_action: String,
+    path: Option<String>,
+    from: Option<String>,
+    to: Option<String>,
+    filter: Option<String>,
+    tab: Option<String>,
+    fallback_payload: Option<V>,
+}
+
+#[derive(Clone, Debug, Default)]
+pub(super) struct CapturedGraphClick {
+    lib_id: String,
+    lib_action: String,
+    in_workspace: bool,
+    attrs: ClickAttrs,
+}
+
+pub(super) fn closest_scoped_attr(
+    target: &web_sys::Element,
+    fallback: &web_sys::Element,
+    attr: &str,
+    require_workspace: bool,
+) -> Option<String> {
+    let selector = format!("[{attr}]");
+    if let Ok(Some(found)) = target.closest(&selector) {
+        if !require_workspace
+            || found
+                .closest("#session-graph-workspace")
+                .ok()
+                .flatten()
+                .is_some()
+        {
+            if let Some(val) = found.get_attribute(attr).filter(|v| !v.is_empty()) {
+                return Some(val);
+            }
+        }
+    }
+    fallback.get_attribute(attr).filter(|v| !v.is_empty())
+}
+
+pub(super) fn capture_graph_click(target: &web_sys::Element) {
+    let lib_el = target
+        .closest("[data-action],button,a[data-view],input[type=checkbox]")
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| target.clone());
+    let lib_id = lib_el.id();
+    let lib_action = lib_el
+        .get_attribute("data-action")
+        .unwrap_or_else(|| lib_id.clone());
+    let in_workspace = target
+        .closest("#session-graph-workspace")
+        .ok()
+        .flatten()
+        .is_some()
+        || lib_el
+            .closest("#session-graph-workspace")
+            .ok()
+            .flatten()
+            .is_some();
+    let is_inspect = lib_action == "inspect-file-graph";
+    if !in_workspace && !is_inspect {
+        CAPTURED_GRAPH_CLICK.with(|c| *c.borrow_mut() = None);
+        return;
+    }
+    let sem_el = if in_workspace {
+        target
+            .closest("[data-action],button,.graph-side-tab,.graph-changes-file,.graph-changes-entity,.graph-impact-row,#session-graph-side,#session-graph-mode-whole,#session-graph-mode-changes,#session-graph-unfold,#session-graph-open-full,[data-path],[data-from],[data-to],[data-filter],[data-tab]")
+            .ok()
+            .flatten()
+            .filter(|el| {
+                el.closest("#session-graph-workspace")
+                    .ok()
+                    .flatten()
+                    .is_some()
+            })
+            .unwrap_or_else(|| lib_el.clone())
+    } else {
+        lib_el.clone()
+    };
+    let resolved_id = if !lib_id.is_empty() {
+        lib_id.clone()
+    } else {
+        sem_el.id()
+    };
+    let resolved_action = sem_el
+        .get_attribute("data-action")
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| {
+            if !lib_action.is_empty() {
+                lib_action.clone()
+            } else {
+                resolved_id.clone()
+            }
+        });
+    let fallback_payload = sem_el
+        .get_attribute("data-payload")
+        .and_then(|raw| serde_json::from_str::<V>(&raw).ok());
+    let attrs = ClickAttrs {
+        resolved_id,
+        resolved_action,
+        path: closest_scoped_attr(target, &lib_el, "data-path", in_workspace),
+        from: closest_scoped_attr(target, &lib_el, "data-from", in_workspace),
+        to: closest_scoped_attr(target, &lib_el, "data-to", in_workspace),
+        filter: closest_scoped_attr(target, &lib_el, "data-filter", in_workspace),
+        tab: closest_scoped_attr(target, &lib_el, "data-tab", in_workspace),
+        fallback_payload,
+    };
+    CAPTURED_GRAPH_CLICK.with(|c| {
+        *c.borrow_mut() = Some(CapturedGraphClick {
+            lib_id,
+            lib_action,
+            in_workspace,
+            attrs,
+        });
+    });
+}
+
+pub(super) fn merge_click_payload(payload: &V, attrs: &ClickAttrs, in_workspace: bool) -> V {
+    let base = if payload.is_null() {
+        attrs.fallback_payload.as_ref().unwrap_or(payload)
+    } else {
+        payload
+    };
+    let has_attrs = attrs.path.is_some()
+        || attrs.from.is_some()
+        || attrs.to.is_some()
+        || attrs.filter.is_some()
+        || attrs.tab.is_some();
+    if !base.is_null() && !base.is_object() {
+        return base.clone();
+    }
+    if !base.is_object() && !in_workspace && !has_attrs {
+        return base.clone();
+    }
+    let mut map = base.as_object().cloned().unwrap_or_default();
+    for (key, value) in [
+        ("path", &attrs.path),
+        ("from", &attrs.from),
+        ("to", &attrs.to),
+        ("filter", &attrs.filter),
+        ("tab", &attrs.tab),
+    ] {
+        if let Some(val) = value {
+            let empty_or_missing = map
+                .get(key)
+                .is_none_or(|cur| cur.is_null() || cur.as_str() == Some(""));
+            if !val.is_empty() && empty_or_missing {
+                map.insert(key.to_owned(), V::String(val.clone()));
+            }
+        }
+    }
+    if in_workspace && !map.contains_key("surface") {
+        map.insert("surface".to_owned(), json!("session"));
+    }
+    if map.is_empty() && base.is_null() {
+        V::Null
+    } else {
+        V::Object(map)
+    }
+}
+
+pub(super) fn extract_inspect_file_path(payload: &V) -> Option<String> {
+    payload
+        .as_str()
+        .or_else(|| payload["path"].as_str())
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(str::to_owned)
+}
+
+fn invokes_skillcache_run_mutation(ev: &V, text: &str) -> bool {
+    let tail = text.split_once(": ").map(|(_, s)| s).unwrap_or(text);
+    let candidate = ev["detail"]
+        .as_str()
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(tail);
+    let mut parts = candidate.split_whitespace();
+    while let Some(tok) = parts.next() {
+        let cmd = tok.rsplit('/').next().unwrap_or(tok);
+        if cmd.eq_ignore_ascii_case("skillcache-run") {
+            return matches!(parts.next(), Some("run" | "continue"));
+        }
+    }
+    false
+}
+
+pub(super) fn is_mutation_tool_event(ev: &V) -> bool {
+    let kind = m::text(ev, "kind");
+    if kind == "skillcache" {
+        return ev["ok"] != json!(false)
+            && (!m::array(&ev["changes"]).is_empty()
+                || matches!(ev["phase"].as_str(), Some("program_completed" | "complete")));
+    }
+    if kind != "tool" {
+        return false;
+    }
+    if ev["state"]
+        .as_str()
+        .is_some_and(|s| s == "started" || s == "in_progress")
+    {
+        return false;
+    }
+    let text = m::text(ev, "text");
+    let tail = text.split_once(": ").map(|(_, s)| s).unwrap_or("");
+    if tail.starts_with("failed") || tail.starts_with("declined") || ev["ok"] == json!(false) {
+        return false;
+    }
+    let still_starting = ev["state"].is_null()
+        && !["completed", "failed", "declined"]
+            .iter()
+            .any(|p| tail.starts_with(p));
+    if still_starting && m::array(&ev["changes"]).is_empty() {
+        return false;
+    }
+    let raw = ev["tool"]
+        .as_str()
+        .unwrap_or_else(|| text.split(": ").next().unwrap_or(""));
+    let norm = raw
+        .strip_suffix("ToolCall")
+        .unwrap_or(raw)
+        .to_ascii_lowercase();
+    matches!(
+        norm.as_str(),
+        "edit"
+            | "write"
+            | "multiedit"
+            | "notebookedit"
+            | "file_change"
+            | "delete"
+            | "skillcache-run"
+    ) || !m::array(&ev["changes"]).is_empty()
+        || (matches!(norm.as_str(), "bash" | "shell" | "command_execution")
+            && invokes_skillcache_run_mutation(ev, &text))
+}
+
+pub(super) fn should_sync_embedded_changes(
+    fresh_events: &[V],
+    focus_changed: bool,
+    was_active: bool,
+    is_active: bool,
+) -> bool {
+    if (was_active && !is_active) || focus_changed {
+        return true;
+    }
+    fresh_events.iter().any(|ev| {
+        let kind = m::text(ev, "kind");
+        if kind == "graph_focus" {
+            return true;
+        }
+        if kind == "status" {
+            let status = ev["status"]
+                .as_str()
+                .unwrap_or_else(|| ev["text"].as_str().unwrap_or(""));
+            return ["completed", "failed", "cancelled", "interrupted"].contains(&status);
+        }
+        is_mutation_tool_event(ev)
+    })
+}
+
+pub(super) fn template_content_node(id: &str) -> Option<web_sys::Node> {
+    let template = dom::get(id)?;
+    js_sys::Reflect::get(&template, &"content".into())
+        .ok()
+        .and_then(|v| v.dyn_into::<web_sys::Node>().ok())
+}
+
+pub(super) fn hydrate_rabbit_svgs() {
+    let Some(content) = template_content_node("rabbit-svg-template") else {
+        return;
+    };
+    for slot in dom::all(".composer-rabbit") {
+        if slot.first_element_child().is_some() {
+            continue;
+        }
+        if let Ok(cloned) = content.clone_node_with_deep(true) {
+            let _ = slot.append_child(&cloned);
+        }
+    }
+}
+
+pub(super) fn hydrate_embedded_graph_panels() {
+    let Some(content) = template_content_node("embedded-graph-panel-template") else {
+        return;
+    };
+    for host in dom::all("[data-graph-prefix]") {
+        if host.first_element_child().is_some() {
+            continue;
+        }
+        let Some(prefix) = host
+            .get_attribute("data-graph-prefix")
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let heading_tag = host
+            .get_attribute("data-graph-heading")
+            .filter(|s| matches!(s.as_str(), "h2" | "h3" | "h4"))
+            .unwrap_or_else(|| "h4".into());
+        let title = host
+            .get_attribute("data-graph-title")
+            .unwrap_or_else(|| "Code graph".into());
+        let scope = host
+            .get_attribute("data-graph-scope")
+            .unwrap_or_else(|| "Code graph".into());
+        let Ok(cloned) = content.clone_node_with_deep(true) else {
+            continue;
+        };
+        if host.append_child(&cloned).is_err() {
+            continue;
+        }
+        if let Ok(nodes) = host.query_selector_all("[data-graph-id]") {
+            for i in 0..nodes.length() {
+                if let Some(el) = nodes
+                    .item(i)
+                    .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+                {
+                    if let Some(suffix) = el.get_attribute("data-graph-id") {
+                        let _ = el.set_attribute("id", &format!("{prefix}-{suffix}"));
+                        let _ = el.remove_attribute("data-graph-id");
+                    }
+                }
+            }
+        }
+        for (source_attr, target_attr) in [
+            ("data-graph-controls", "aria-controls"),
+            ("data-graph-labelledby", "aria-labelledby"),
+        ] {
+            let selector = format!("[{source_attr}]");
+            if let Ok(nodes) = host.query_selector_all(&selector) {
+                for i in 0..nodes.length() {
+                    if let Some(el) = nodes
+                        .item(i)
+                        .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+                    {
+                        if let Some(suffix) = el.get_attribute(source_attr) {
+                            let _ = el.set_attribute(target_attr, &format!("{prefix}-{suffix}"));
+                            let _ = el.remove_attribute(source_attr);
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(nodes) = host.query_selector_all("[data-graph-role]") {
+            for i in 0..nodes.length() {
+                let Some(el) = nodes
+                    .item(i)
+                    .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+                else {
+                    continue;
+                };
+                let role = el.get_attribute("data-graph-role").unwrap_or_default();
+                let _ = el.remove_attribute("data-graph-role");
+                match role.as_str() {
+                    "title" => {
+                        if heading_tag != "h4" {
+                            let heading = dom::el(&heading_tag, "session-graph-title", &title);
+                            let _ = heading.set_attribute("id", &format!("{prefix}-title"));
+                            let _ = el.replace_with_with_node_1(&heading);
+                        } else {
+                            el.set_text_content(Some(&title));
+                        }
+                    }
+                    "toolbar" => {
+                        let _ = el.set_attribute("aria-label", &format!("{scope} controls"));
+                    }
+                    "filter-label" => {
+                        el.set_text_content(Some(if prefix == "session-graph" {
+                            "Filter graph names"
+                        } else {
+                            "Filter service graph names"
+                        }));
+                    }
+                    "crumbs" => {
+                        let label = match prefix.as_str() {
+                            "session-graph" => "Graph breadcrumbs",
+                            "system-member-graph" => "Service graph breadcrumbs",
+                            _ => "Change service graph breadcrumbs",
+                        };
+                        let _ = el.set_attribute("aria-label", label);
+                    }
+                    "canvas" => {
+                        let label = match prefix.as_str() {
+                            "session-graph" => "Interactive code graph canvas",
+                            "system-member-graph" => "Interactive service code graph canvas",
+                            _ => "Interactive change service code graph canvas",
+                        };
+                        let _ = el.set_attribute("aria-label", label);
+                    }
+                    "side" => {
+                        let label = match prefix.as_str() {
+                            "session-graph" => "Selected code unit details",
+                            "system-member-graph" => "Selected service code unit details",
+                            _ => "Selected change service code unit details",
+                        };
+                        let _ = el.set_attribute("aria-label", label);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+}
+
+pub(super) fn hydrate_templates() {
+    hydrate_rabbit_svgs();
+    hydrate_embedded_graph_panels();
+}
+
 pub fn initialize() {
+    hydrate_templates();
     for prefix in ["session-budgets", "creator-budgets", "creator-run-budgets"] {
         budget_editor(prefix);
     }
@@ -76,8 +536,34 @@ pub fn initialize() {
         let _ = media.add_event_listener_with_callback("change", c.as_ref().unchecked_ref());
         c.forget();
     }
+    LAST_MOBILE_VIEWPORT.with(|last| last.set(Some(dom::is_mobile_viewport())));
+    dom::on_viewport_resize("session-responsive-viewport", 0, || {
+        sync_responsive_viewport();
+    });
+    let capture_click = Closure::<dyn FnMut(web_sys::Event)>::new(|event: web_sys::Event| {
+        if let Some(target) = event
+            .target()
+            .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+        {
+            capture_graph_click(&target);
+        } else {
+            CAPTURED_GRAPH_CLICK.with(|c| *c.borrow_mut() = None);
+        }
+    });
+    let _ = dom::document().add_event_listener_with_callback_and_bool(
+        "click",
+        capture_click.as_ref().unchecked_ref(),
+        true,
+    );
+    capture_click.forget();
+    on_project_change(|_| {
+        if !m::read(|s| s.boot.is_null()) {
+            history();
+        }
+    });
+    dom::sync_a11y_widgets();
 }
-fn apply_theme(preference: &str) {
+pub(super) fn apply_theme(preference: &str) {
     let dark = dom::window()
         .match_media("(prefers-color-scheme: dark)")
         .ok()
@@ -100,9 +586,48 @@ fn apply_theme(preference: &str) {
         }
     }
 }
+pub(crate) fn resolve_bootstrap_session_id(
+    route_project: &str,
+    route_session: &str,
+    previous_sid: &str,
+    prefs: &V,
+    sessions: &[V],
+    projects: &[V],
+) -> String {
+    if !route_session.is_empty() {
+        return route_session.to_owned();
+    }
+    let candidate = if !previous_sid.is_empty() {
+        previous_sid.to_owned()
+    } else {
+        m::text(prefs, "session_id")
+    };
+    if candidate.is_empty() {
+        return String::new();
+    }
+    let route_project_valid =
+        !route_project.is_empty() && projects.iter().any(|p| m::text(p, "id") == route_project);
+    if route_project_valid {
+        let session_project = sessions
+            .iter()
+            .find(|s| m::text(s, "id") == candidate)
+            .map(|s| m::text(s, "project_id"))
+            .unwrap_or_default();
+        if session_project != route_project {
+            return String::new();
+        }
+    }
+    candidate
+}
+
 pub async fn bootstrap() {
     dom::hidden("connecting", false);
     dom::disabled("reconnect", true);
+    let previous_sid = m::read(|s| s.sid.clone());
+    stop_poll();
+    dom::cancel_timer("results-poll");
+    dom::cancel_timer("idle-poll");
+    api::stop_sse();
     match api::get("/api/bootstrap").await {
         Ok(boot)
             if boot["csrf"].is_string()
@@ -110,34 +635,80 @@ pub async fn bootstrap() {
                 && boot["providers"].is_array() =>
         {
             m::set("app-update", boot["update"].clone());
+            let boot_omnigraph = boot["omnigraph"].clone();
             m::write(|s| {
+                s.epoch = s.epoch.saturating_add(1);
+                s.sid.clear();
+                s.selected = V::Null;
+                s.events.clear();
+                s.seen.clear();
+                s.cursor = 0;
+                s.stream = m::SessionStreamState::default();
                 s.sessions = m::array(&boot["sessions"]);
+                run::sync_waiting_counts_from_sessions(
+                    &s.sessions,
+                    &mut s.approvals.waiting_counts,
+                );
                 s.boot = boot;
                 s.auth_failed = false;
             });
+            dom::clear("events");
+            run::reset();
+            reset_session_settings_state();
             dom::hidden("connection-banner", true);
             render_update();
             spawn_local(async {
                 update_status(true).await;
             });
             populate();
-            history();
             restore_preferences();
+            history();
+            if boot_omnigraph.is_object() {
+                omnigraph::hydrate_status(&boot_omnigraph);
+            }
+            spawn_local(async {
+                omnigraph::refresh_pill().await;
+            });
             spawn_local(async {
                 sign_in(false).await;
             });
+            m::set("bootstrapping", json!(true));
+            initialize_sse_listeners();
+            api::start_sse();
+            let route = dom::hash_route();
             let wanted = dom::json_storage(PREFS);
-            let sid = m::text(&wanted, "session_id");
+            let (sessions, projects) =
+                m::read(|s| (s.sessions.clone(), m::array(&s.boot["projects"])));
+            let sid = resolve_bootstrap_session_id(
+                &route.project,
+                &route.session,
+                &previous_sid,
+                &wanted,
+                &sessions,
+                &projects,
+            );
             if !sid.is_empty() && m::read(|s| s.sessions.iter().any(|x| m::text(x, "id") == sid)) {
                 select(&sid).await;
             }
-            let view = dom::hash_view();
-            open_view(if view.is_empty() { "sessions" } else { &view }, false).await;
+            apply_hash_route().await;
+            m::take("bootstrapping");
+            history();
+            flush_pending_sse_resync();
+            run::sync_approvals_badge();
+            if m::read(|s| s.view != "sessions") && !dom::value("project").is_empty() {
+                crate::graph_map::sync_embedded(false);
+                spawn_local(async {
+                    crate::graph::load(true).await;
+                });
+            }
         }
-        Ok(_) => dom::error(
-            "connection-message",
-            "The runner returned incomplete workspace configuration.",
-        ),
+        Ok(_) => {
+            dom::error(
+                "connection-message",
+                "The runner returned incomplete workspace configuration.",
+            );
+            dom::hidden("connection-banner", false);
+        }
         Err(e) => {
             dom::error("connection-message", &e.message);
             dom::hidden("connection-banner", false);
@@ -150,9 +721,7 @@ pub async fn bootstrap() {
 pub fn populate() {
     let boot = m::read(|s| s.boot.clone());
     let projects = m::array(&boot["projects"]);
-    for id in ["project", "project-switcher", "system-project"] {
-        dom::options(id, &projects, m::summary, None);
-    }
+    dom::options("project-switcher", &projects, m::summary, None);
     dom::options(
         "provider",
         &m::array(&boot["providers"]),
@@ -176,8 +745,24 @@ pub fn populate() {
         m::summary,
         None,
     );
-    for id in ["system-provider", "system-discovery-provider", "clash-challenger"] {
+    for id in [
+        "creator-provider",
+        "system-provider",
+        "system-discovery-provider",
+        "clash-challenger",
+    ] {
         dom::options(id, &m::array(&boot["providers"]), m::summary, None);
+    }
+    let editions = m::array(&boot["accelerators"])
+        .into_iter()
+        .find(|kit| kit["id"] == "kit2")
+        .map(|kit| m::array(&kit["editions"]))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|edition| edition.as_str().map(|id| json!({"id":id,"name":id})))
+        .collect::<Vec<_>>();
+    for id in ["setup-edition", "setup-attach-edition"] {
+        dom::options(id, &editions, m::summary, None);
     }
     dom::clear("fleet-lenses");
     for lens in m::array(&boot["runtime"]["fleet"]["lenses"]) {
@@ -266,8 +851,13 @@ pub fn models(prefix: &str, requested: Option<String>) {
         m::summary,
         None,
     );
+    let custom_field = if prefix.is_empty() {
+        "custom-model-field".to_owned()
+    } else {
+        format!("{prefix}custom-field")
+    };
     dom::hidden(
-        &format!("{prefix}custom-field"),
+        &custom_field,
         !custom && dom::value(&format!("{prefix}model-choice")) != "--custom--",
     );
     dom::disabled(
@@ -283,7 +873,7 @@ pub fn models(prefix: &str, requested: Option<String>) {
     }
     dom::text("model-hint", metadata["detail"].as_str().unwrap_or(""));
 }
-fn restore_model_routing(value: &V) {
+pub(super) fn restore_model_routing(value: &V) {
     dom::set_checked("model-routing-enabled", value.is_object());
     for role in ["plan", "edit"] {
         let prefix = format!("routing-{role}-");
@@ -305,6 +895,12 @@ pub fn selected_model(prefix: &str) -> V {
         V::Null
     } else {
         json!(v)
+    }
+}
+pub(crate) fn model_selection_valid(custom_selected: bool, selected: &V) -> bool {
+    match selected.as_str() {
+        Some(x) => x.len() <= 120 && !x.starts_with('-') && !x.chars().any(char::is_control),
+        None => !custom_selected,
     }
 }
 pub fn routing() -> V {
@@ -383,7 +979,7 @@ pub fn budgets(prefix: &str) -> V {
     }
     v
 }
-fn valid_budgets(v: &V) -> bool {
+pub(super) fn valid_budgets(v: &V) -> bool {
     ["usd", "tokens", "seconds"].iter().all(|k| {
         v[*k].is_null()
             || m::number(&v[*k])
@@ -400,7 +996,7 @@ pub fn restore_budgets(prefix: &str, v: &V) {
         dom::set_value(&format!("{prefix}-{k}"), &m::string(&v[k]));
     }
 }
-fn split_budgets(prefix: &str) {
+pub(super) fn split_budgets(prefix: &str) {
     if !["usd", "tokens", "seconds"]
         .iter()
         .all(|key| dom::numeric_valid(&format!("{prefix}-agent-{key}")))
@@ -459,11 +1055,23 @@ fn split_budgets(prefix: &str) {
         );
     }
 }
-pub fn controls() {
+struct ComposerValidation {
+    ready: bool,
+    locked: bool,
+    workflow: String,
+    feature: String,
+    sdd: bool,
+    sdd_valid: bool,
+    helper_valid: bool,
+    model_valid: bool,
+    prompt: String,
+    valid: bool,
+}
+
+fn evaluate_composer_validation() -> ComposerValidation {
     let inbox_retry = inbox::needs_confirmation();
-    let (sid, session, locked, ready) = m::read(|s| {
+    let (session, locked, ready) = m::read(|s| {
         (
-            s.sid.clone(),
             s.selected.clone(),
             s.pending || m::active(&s.selected) || inbox_retry,
             !s.boot.is_null() && !s.auth_failed,
@@ -477,24 +1085,14 @@ pub fn controls() {
     let phase = dom::value("sdd-phase");
     let phases = m::read(|s| m::array(&s.boot["sdd_phases"]));
     let sdd_valid = !sdd || m::sdd_settings_valid(&feature, &phase, &phases);
-    if sdd {
-        dom::set_value("mode", m::sdd_mode(&phase));
-    } else if ["plan", "review", "fleet-review"].contains(&workflow.as_str()) {
-        dom::set_value("mode", "plan");
-    } else if !sid.is_empty() && session["workflow"] == "native" && routing().is_null() {
-        dom::set_value("mode", &m::text(&session, "mode"));
-    }
     let dry = fleet && dom::checked("fleet-dry-run");
     let prompt = dom::value("prompt");
     let count = dom::num("agent-count").as_u64().unwrap_or(0);
     let max = m::read(|s| s.boot["runtime"]["max_agents"].as_u64().unwrap_or(40));
     let helper_valid = !dom::checked("agents-enabled") || (1..=max).contains(&count);
     let model = selected_model("");
-    let model_valid = model
-        .as_str()
-        .map(|x| x.len() <= 120 && !x.starts_with('-') && !x.chars().any(char::is_control))
-        .unwrap_or(true);
-    let inbox_active = inbox::eligible(&session);
+    let custom_model = dom::value("model-choice") == "--custom--";
+    let model_valid = model_selection_valid(custom_model, &model);
     let valid = ready
         && !m::read(|s| s.pending)
         && if inbox_retry {
@@ -513,15 +1111,79 @@ pub fn controls() {
                 && (dry || m::yes(&provider["available"]))
                 && session["workflow"] != "fleet-review"
         };
+    ComposerValidation {
+        ready,
+        locked,
+        workflow,
+        feature,
+        sdd,
+        sdd_valid,
+        helper_valid,
+        model_valid,
+        prompt,
+        valid,
+    }
+}
+
+/// Lightweight `#prompt` input validation updating only send eligibility & SDD slug hint
+/// without running the full `controls()` layout/sub-pane refresh on every keystroke.
+pub fn update_send_control() {
+    let check = evaluate_composer_validation();
+    dom::disabled("send", !check.valid);
+    dom::error(
+        "sdd-error",
+        if check.sdd
+            && !check.sdd_valid
+            && (!check.feature.is_empty() || !check.prompt.trim().is_empty())
+        {
+            "Enter a feature slug using lowercase letters, digits and single hyphens; memory is reserved."
+        } else {
+            ""
+        },
+    );
+}
+
+pub fn controls() {
+    let check = evaluate_composer_validation();
+    let inbox_retry = inbox::needs_confirmation();
+    let (sid, session, locked, ready) =
+        m::read(|s| (s.sid.clone(), s.selected.clone(), check.locked, check.ready));
+    let provider = m::provider(&dom::value("provider"));
+    let workflow = check.workflow;
+    let fleet = workflow == "fleet-review";
+    let sdd = check.sdd;
+    let feature = check.feature;
+    let phase = dom::value("sdd-phase");
+    let phases = m::read(|s| m::array(&s.boot["sdd_phases"]));
+    let sdd_valid = check.sdd_valid;
+    if sdd {
+        dom::set_value("mode", m::sdd_mode(&phase));
+    } else if ["plan", "review", "fleet-review"].contains(&workflow.as_str()) {
+        dom::set_value("mode", "plan");
+    } else if !sid.is_empty() && session["workflow"] == "native" && routing().is_null() {
+        dom::set_value("mode", &m::text(&session, "mode"));
+    }
+    let prompt = check.prompt;
+    let helper_valid = check.helper_valid;
+    let model_valid = check.model_valid;
+    let inbox_active = inbox::eligible(&session);
+    let valid = check.valid;
+    let project_id = dom::value("project");
+    dom::disabled("preflight-check", !ready || project_id.is_empty());
+    dom::disabled("preflight-risk-callers", !ready || project_id.is_empty());
     dom::disabled("send", !valid);
+    dom::hidden("cancel-session", sid.is_empty() || !m::active(&session));
     dom::disabled(
         "cancel-session",
         !m::active(&session) || m::read(|s| s.pending),
     );
     dom::hidden("welcome", !sid.is_empty());
-    dom::text(
+    let status_label = session["status"].as_str().unwrap_or("New session");
+    dom::text("session-status", status_label);
+    dom::attr(
         "session-status",
-        session["status"].as_str().unwrap_or("New session"),
+        "aria-label",
+        &format!("Session status: {status_label}"),
     );
     dom::text(
         "send-label",
@@ -549,11 +1211,29 @@ pub fn controls() {
     ] {
         dom::disabled(id, !ready || locked || !sid.is_empty());
     }
+    let git = m::data("project-git");
+    let worktree_ok = m::yes(&git["worktree_available"]);
+    let worktrees = m::array(&m::data("project-worktrees")["worktrees"]);
+    dom::disabled(
+        "refresh-project-git",
+        !ready || locked || project_id.is_empty(),
+    );
+    dom::disabled("workspace-worktree-option", !worktree_ok);
+    dom::disabled(
+        "workspace-existing-option",
+        !worktree_ok || worktrees.is_empty(),
+    );
+    if git.is_object() {
+        dom::text("project-git-status", &format_project_git_status(&git));
+        dom::text(
+            "workspace-hint",
+            &format_workspace_hint(&dom::value("workspace"), &git),
+        );
+    }
     for id in [
         "model-choice",
         "thinking-effort",
         "agents-enabled",
-        "agent-count",
         "mode",
         "prompt",
         "attach-files",
@@ -561,10 +1241,13 @@ pub fn controls() {
         dom::disabled(id, !ready || locked);
     }
     dom::disabled(
+        "agent-count",
+        !ready || locked || !dom::checked("agents-enabled"),
+    );
+    dom::disabled(
         "prompt",
         !ready || m::read(|s| s.pending) || inbox_retry || (m::active(&session) && !inbox_active),
     );
-    dom::disabled("add-task-context", !task_context_available());
     dom::attr(
         "prompt",
         "placeholder",
@@ -575,8 +1258,12 @@ pub fn controls() {
         },
     );
     if inbox_active || inbox_retry {
+        commands::close();
     }
     dom::hidden("fleet-settings", !fleet);
+    for id in ["fleet-dry-run", "fleet-budget", "fleet-worker-timeout"] {
+        dom::disabled(id, !ready || locked || !fleet);
+    }
     let sdd_locked = !ready || locked || session["status"] == "awaiting_context";
     dom::hidden("sdd-settings", !sdd);
     dom::disabled("sdd-feature", !sdd || sdd_locked || !sid.is_empty());
@@ -595,6 +1282,24 @@ pub fn controls() {
             || ["plan", "review", "fleet-review", "sdd"].contains(&workflow.as_str())
             || !sid.is_empty() && routing().is_null(),
     );
+    // Read-only workflows never edit, so their launches never ask.
+    let read_only = ["plan", "review", "fleet-review"].contains(&workflow.as_str());
+    dom::disabled("permissions", !ready || locked || read_only);
+    let permission = dom::value("permissions");
+    let editing = if read_only {
+        "plan".to_owned()
+    } else {
+        dom::value("mode")
+    };
+    dom::text(
+        "permissions-hint",
+        permissions_hint(&dom::value("provider"), &editing, &permission),
+    );
+    dom::attr(
+        "permissions-hint",
+        "data-mode",
+        permissions_hint_mode(read_only, &editing, &permission),
+    );
     let description = phases
         .iter()
         .find(|entry| entry["id"] == phase)
@@ -603,9 +1308,13 @@ pub fn controls() {
     dom::text(
         "sdd-hint",
         &format!(
-        "{description} Documents: specs/{}/. Feature stays fixed; phase can change between turns.",
-        if feature.is_empty() {"<feature>"} else {&feature}
-    ),
+            "{description} Documents: specs/{}/. Feature stays fixed; phase can change between turns.",
+            if feature.is_empty() {
+                "<feature>"
+            } else {
+                &feature
+            }
+        ),
     );
     dom::error(
         "sdd-error",
@@ -627,7 +1336,34 @@ pub fn controls() {
             || sdd_locked
             || m::yes(&m::data("sdd-documents-pending")),
     );
-    dom::hidden("clash-settings", !dom::checked("clash-enabled"));
+    let merging = m::data("merge-draft").is_object();
+    let clash_supported = ["native", "review"].contains(&workflow.as_str());
+    dom::disabled(
+        "clash-enabled",
+        !ready || locked || merging || !clash_supported,
+    );
+    let clash_active = dom::checked("clash-enabled");
+    dom::hidden("clash-settings", !clash_active);
+    for id in [
+        "clash-challenger",
+        "clash-rounds",
+        "clash-model-choice",
+        "clash-thinking-effort",
+    ] {
+        dom::disabled(id, !ready || locked || !clash_active || !clash_supported);
+    }
+    dom::disabled(
+        "clash-model",
+        !ready
+            || locked
+            || !clash_active
+            || !clash_supported
+            || dom::value("clash-model-choice") != "--custom--",
+    );
+    dom::hidden(
+        "clash-custom-field",
+        dom::value("clash-model-choice") != "--custom--",
+    );
     dom::hidden(
         "worktree-branch-field",
         dom::value("workspace") != "worktree",
@@ -642,7 +1378,7 @@ pub fn controls() {
     );
     dom::disabled(
         "model",
-        locked || dom::value("model-choice") != "--custom--",
+        !ready || locked || dom::value("model-choice") != "--custom--",
     );
     let route_enabled = !routing().is_null();
     dom::hidden(
@@ -673,7 +1409,6 @@ pub fn controls() {
             !ready || locked || !route_enabled || !custom,
         );
     }
-    dom::hidden("brain-link-config", !sid.is_empty());
     dom::error(
         "agent-count-error",
         if helper_valid {
@@ -717,1880 +1452,74 @@ pub fn controls() {
             "Off"
         },
     );
+    let settings_invalid = !helper_valid
+        || !model_valid
+        || !sdd_valid
+        || !budget_fields_valid("session-budgets")
+        || !valid_budgets(&budgets("session-budgets"));
+    if sid.is_empty() {
+        m::take("session-settings-owner");
+        dom::hidden("session-summary", true);
+        dom::hidden("session-settings", false);
+        dom::attr("session-settings-toggle", "aria-expanded", "false");
+        dom::attr("session-settings-toggle", "data-invalid", "false");
+    } else {
+        let provider_name = {
+            let name = m::summary(&provider);
+            if name.is_empty() {
+                dom::value("provider")
+            } else {
+                name
+            }
+        };
+        let model_label = selected_model("")
+            .as_str()
+            .map(|id| {
+                m::array(&provider["model_options"]["models"])
+                    .into_iter()
+                    .find(|entry| entry["id"] == id)
+                    .and_then(|entry| entry["label"].as_str().map(str::to_owned))
+                    .filter(|label| !label.is_empty())
+                    .unwrap_or_else(|| id.to_owned())
+            })
+            .unwrap_or_default();
+        let summary = format_session_summary(
+            &provider_name,
+            &dom::value("mode"),
+            &permission,
+            &model_label,
+            !routing().is_null(),
+        );
+        dom::text("session-summary-text", &summary);
+        dom::hidden("session-summary", false);
+        dom::attr(
+            "session-settings-toggle",
+            "data-invalid",
+            if settings_invalid { "true" } else { "false" },
+        );
+        let owner = json!([m::read(|s| s.epoch), sid]);
+        if m::data("session-settings-owner") != owner {
+            m::set("session-settings-owner", owner);
+            dom::hidden("session-settings", true);
+            dom::attr("session-settings-toggle", "aria-expanded", "false");
+        }
+    }
     dom::hidden("waiting", !m::active(&session));
     dom::text(
         "waiting-text",
-        if session["status"] == "queued" {
-            "Queued — waiting for an available runner."
-        } else {
-            "Agent is running."
-        },
+        waiting_banner_text(
+            session["status"].as_str().unwrap_or(""),
+            run::permission_waiting(),
+        ),
     );
+    omnigraph::session_controls();
     context_meter(&session);
     result_controls();
     merge_controls();
     inbox::render();
     run::render();
-}
-pub async fn open_view(view: &str, record: bool) {
-    let previous_view = m::read(|state| state.view.clone());
-    let known = [
-        "sessions",
-        "changes",
-        "checks",
-        "usage",
-        "systems",
-        "system-changes",
-    ];
-    let view = if known.contains(&view) {
-        view
-    } else {
-        "sessions"
-    };
-    if m::read(|s| ["changes", "checks", "usage"].contains(&s.view.as_str()))
-        && !["changes", "checks", "usage"].contains(&view)
-    {
-        reset_results();
-    }
-    m::write(|s| s.view = view.into());
-    let is_results = ["changes", "checks", "usage"].contains(&view);
-    for e in dom::all("#main > section.view") {
-        dom::hide(
-            &e,
-            e.id()
-                != if is_results {
-                    "results-view".into()
-                } else {
-                    format!("{view}-view")
-                },
-        );
-    }
-    if is_results {
-        dom::attr("results-view", "data-tab", view);
-    }
-    if record {
-        let _ = dom::window()
-            .history()
-            .and_then(|h| h.push_state_with_url(&JsValue::NULL, "", Some(&format!("#/{view}"))));
-    }
-    let group = if is_results {
-        "sessions"
-    } else if view == "system-changes" {
-        "systems"
-    } else {
-        view
-    };
-    m::set(&format!("last-view-{group}"), json!(view));
-    render_tabs(view, group);
-    for e in dom::all(".navigation [data-nav]") {
-        if e.get_attribute("data-nav").as_deref() == Some(group) {
-            let _ = e.set_attribute("aria-current", "page");
-        } else {
-            let _ = e.remove_attribute("aria-current");
-        }
-    }
-    dom::text(
-        "view-heading",
-        &match view {
-            "systems" => "Services".to_owned(),
-            "system-changes" => "Changes".to_owned(),
-            _ => m::label(view),
-        },
-    );
-    // The page title repeats the navigation entry it belongs to.
-    let (title, subtitle) = match group {
-        "systems" => (
-            "System Orchestration",
-            "Services, their contracts and changes that span them",
-        ),
-        _ => ("Sessions", "Your local workspace for agent sessions"),
-    };
-    dom::text("page-title", title);
-    dom::text("page-subtitle", subtitle);
-    dom::class("sidebar", "open", false);
-    dom::focus("view-heading");
-    match view {
-        "changes" | "checks" | "usage" => results().await,
-        "systems" | "system-changes" => {
-            systems::adopt_sidebar_project(&previous_view);
-            systems::load().await;
-            if view == "systems" {
-                systems::catalog_autoload().await;
-            }
-        }
-        _ => load_git().await,
-    }
-}
-fn history_projection(sessions: &[V], sid: &str) -> V {
-    V::Array(
-        sessions
-            .iter()
-            .map(|session| {
-                let id = m::text(session, "id");
-                json!({"id":id,"label":format!("{} · {}",m::summary(session),m::label(session["status"].as_str().unwrap_or(""))),"selected":id==sid})
-            })
-            .collect(),
-    )
-}
-pub fn history() {
-    if dom::get("history").is_none() {
-        return;
-    }
-    let projection = m::read(|s| history_projection(&s.sessions, &s.sid));
-    if m::data("history-projection") == projection {
-        return;
-    }
-    dom::clear("history");
-    for v in projection.as_array().into_iter().flatten() {
-        let id = m::text(v, "id");
-        let b = dom::button(&m::text(v, "label"), "session-open", json!(id));
-        b.set_class_name("history-item");
-        if m::yes(&v["selected"]) {
-            let _ = b.set_attribute("aria-current", "true");
-        }
-        dom::append("history", &b);
-    }
-    m::set("history-projection", projection);
-}
-pub async fn refresh() {
-    match api::get("/api/sessions").await {
-        Ok(v) => {
-            m::write(|s| s.sessions = m::array(&v["sessions"]));
-            history();
-        }
-        Err(e) => dom::error("events-error", &e.message),
-    }
-}
-fn preferences_selection(mut prefs: V, project: &str, sid: &str) -> V {
-    if !prefs.is_object() {
-        prefs = json!({});
-    }
-    prefs["project_id"] = json!(project);
-    prefs["session_id"] = nullable(sid.to_owned());
-    prefs
-}
-fn preferences_update(
-    mut prefs: V,
-    project: &str,
-    sid: &str,
-    fields: V,
-    merge_draft: &V,
-) -> Option<V> {
-    if merge_draft.is_object() {
-        return None;
-    }
-    if !prefs.is_object() {
-        prefs = json!({});
-    }
-    if !prefs["drafts"].is_object() {
-        prefs["drafts"] = json!({});
-    }
-    if sid.is_empty() {
-        prefs["drafts"][project] = fields;
-    }
-    Some(preferences_selection(prefs, project, sid))
-}
-fn merge_draft_owned(draft: &V, sid: &str, project: &str, epoch: u64) -> bool {
-    draft.is_object()
-        && sid.is_empty()
-        && draft["project_id"] == project
-        && draft["selection_epoch"].as_u64() == Some(epoch)
-}
-fn reset_merge_archive() {
-    m::next("merge-archive");
-    m::next("merge-archive-scope");
-    m::take("delete-armed");
-    dom::clear("merge-archive-content");
-    dom::hidden("merge-archive-content", true);
-    dom::text("merge-delete", "Delete saved context");
-    dom::hidden("merge-delete-keep", true);
-}
-fn budget_request(session: &V, limits: V, timeout: V) -> V {
-    let mut request = json!({"budgets":limits,"revision":session["budget_revision"]});
-    if session["workflow"] == "fleet-review" || session["fleet"].is_object() {
-        request["worker_timeout"] = timeout;
-    }
-    request
-}
-fn draft_project(selected: &str) -> String {
-    m::data("composer-project")
-        .as_str()
-        .filter(|owner| !owner.is_empty())
-        .map(str::to_owned)
-        .unwrap_or_else(|| selected.to_owned())
-}
-pub fn save_preferences() {
-    if m::read(|s| s.restoring || s.boot.is_null()) {
-        return;
-    }
-    inbox::save_draft();
-    let prefs = dom::json_storage(PREFS);
-    let project = draft_project(&dom::value("project"));
-    let mut fields = json!({});
-    for id in PREF_FIELDS {
-        fields[*id] = if [
-            "agents-enabled",
-            "clash-enabled",
-            "fleet-dry-run",
-            "brain-link-review",
-        ]
-        .contains(id)
-        {
-            json!(dom::checked(id))
-        } else {
-            json!(dom::value(id))
-        };
-    }
-    fields["budgets"] = budgets("session-budgets");
-    fields["routing"] = routing();
-    fields["bank"] = json!(dom::value("brain-link-bank"));
-    fields["task"] = json!(dom::value("brain-link-task"));
-    fields["prompt"] = json!(dom::value("prompt"));
-    let sid = m::read(|s| s.sid.clone());
-    if let Some(updated) =
-        preferences_update(prefs, &project, &sid, fields, &m::data("merge-draft"))
-    {
-        dom::save(PREFS, Some(&updated.to_string()));
-    }
-}
-fn restore_preferences() {
-    let prefs = dom::json_storage(PREFS);
-    let project = m::text(&prefs, "project_id");
-    if !m::project(&project).is_null() {
-        sync_project(&project);
-    }
-    restore_draft(&dom::value("project"));
-}
-fn restore_draft(project: &str) {
-    m::set("composer-project", json!(project));
-    let prefs = dom::json_storage(PREFS);
-    let fields = &prefs["drafts"][project];
-    if !fields.is_object() {
-        return;
-    }
-    m::write(|s| s.restoring = true);
-    for id in PREF_FIELDS {
-        if let Some(b) = fields[*id].as_bool() {
-            dom::set_checked(id, b);
-        } else if let Some(v) = fields[*id].as_str() {
-            dom::set_value(id, v);
-        }
-    }
-    let model = fields["model"].as_str().unwrap_or("").to_owned();
-    models(
-        "",
-        Some(if fields["model-choice"] == "--custom--" {
-            model
-        } else {
-            m::text(fields, "model-choice")
-        }),
-    );
-    dom::set_value("thinking-effort", &m::text(fields, "thinking-effort"));
-    restore_budgets("session-budgets", &fields["budgets"]);
-    restore_model_routing(&fields["routing"]);
-    dom::set_value("prompt", &m::text(fields, "prompt"));
-    m::write(|s| s.restoring = false);
-}
-pub fn sync_project(id: &str) {
-    for select in [
-        "project",
-        "project-switcher",
-        "context-project",
-        "memory-use-project",
-        "memory-project",
-        "brain-project",
-        "skills-project",
-        "create-skill-project",
-        "setup-project",
-        "creator-project",
-        "accelerator-project",
-        "system-project",
-    ] {
-        let held = select == "system-project"
-            && (m::yes(&m::data("editor-dirty"))
-                || m::yes(&m::data("editor-pending"))
-                || m::yes(&m::data("system-pending")))
-            || select == "creator-project" && m::yes(&m::data("creator-pending"));
-        let scope = match select {
-            "creator-project" => Some("creator-scope"),
-            "system-project" => Some("editor-scope"),
-            "memory-project" => Some("memory-knowledge-scope"),
-            "brain-project" => Some("brain-knowledge-scope"),
-            _ => None,
-        };
-        let changed = scope
-            .is_some_and(|scope| m::project_scope_transition(scope, &dom::value(select), id, held));
-        if !held {
-            dom::set_value(select, id);
-        }
-        if changed {
-            if select == "system-project" {
-                systems::reset_system_project();
-            }
-        }
-    }
-    m::set("composer-project", json!(id));
-}
-pub fn new_session(project: Option<&str>) {
-    if m::read(|s| s.pending) {
-        return;
-    }
-    reset_results();
-    save_preferences();
-    reset_merge_archive();
-    m::take("merge-draft");
-    stop_poll();
-    m::write(|s| {
-        s.epoch += 1;
-        s.sid.clear();
-        s.selected = V::Null;
-        s.events.clear();
-        s.seen.clear();
-        s.cursor = 0;
-    });
-    m::take("merge-draft");
-    clear_files();
-    dom::clear("events");
-    dom::set_value("prompt", "");
-    if let Some(p) = project {
-        sync_project(p);
-    }
-    restore_draft(&dom::value("project"));
-    let selected = preferences_selection(dom::json_storage(PREFS), &dom::value("project"), "");
-    dom::save(PREFS, Some(&selected.to_string()));
-    history();
-    controls();
-    dom::focus("prompt");
-}
-pub async fn select(id: &str) {
-    if m::read(|s| s.pending) {
-        return;
-    }
-    reset_results();
-    save_preferences();
-    stop_poll();
-    m::write(|s| {
-        s.epoch += 1;
-        s.sid = id.into();
-        s.selected = V::Null;
-        s.events.clear();
-        s.seen.clear();
-        s.cursor = 0;
-    });
-    clear_files();
-    dom::clear("events");
-    dom::set_value("prompt", "");
-    inbox::restore(id);
-    run::reset();
-    spawn_local(async {
-        open_view("sessions", true).await;
-    });
-    let epoch = m::read(|s| s.epoch);
-    poll(epoch).await;
-    if !m::read(|s| m::selection_matches(&s.sid, s.epoch, id, epoch)) {
-        return;
-    }
-    let project = m::read(|s| m::text(&s.selected, "project_id"));
-    if !project.is_empty() {
-        sync_project(&project);
-    }
-    history();
-    save_preferences();
-    controls();
-}
-pub fn stop_poll() {
-    dom::cancel_timer("session-poll");
-    m::next("session-poll");
-    inbox::stop();
-    dom::error("inbox-error", "");
-}
-pub async fn poll(epoch: u64) {
-    let (sid, cursor) = m::read(|s| (s.sid.clone(), s.cursor));
-    if sid.is_empty() || epoch != m::read(|s| s.epoch) {
-        return;
-    }
-    let path = format!("/api/sessions/{}?after={cursor}", dom::enc(&sid));
-    match api::scoped("session-poll", &path).await {
-        Ok((e, data)) if m::current("session-poll", e) && epoch == m::read(|s| s.epoch) => {
-            if data["session"]["id"] != sid {
-                dom::error(
-                    "events-error",
-                    "The runner returned a different session. Refresh before retrying.",
-                );
-                return;
-            }
-            m::upsert(data["session"].clone());
-            apply_settings(&data["session"]);
-            let events = m::array(&data["events"]);
-            let length = events.len();
-            for event in events {
-                let key = m::string(&event["id"]);
-                let fresh = m::write(|s| {
-                    if !s.seen.insert(key) {
-                        false
-                    } else {
-                        s.cursor = s.cursor.max(
-                            event["id"]
-                                .as_u64()
-                                .or_else(|| event["id"].as_str()?.parse().ok())
-                                .unwrap_or(0),
-                        );
-                        s.events.push(event.clone());
-                        true
-                    }
-                });
-                if fresh {
-                    run::observe(event);
-                }
-            }
-            inbox::refresh(&sid, epoch).await;
-            if !m::current("session-poll", e)
-                || !m::read(|s| m::selection_matches(&s.sid, s.epoch, &sid, epoch))
-            {
-                return;
-            }
-            history();
-            controls();
-            dom::error("events-error", "");
-            if length == 250 || m::read(|s| m::active(&s.selected)) || inbox::watching(&sid) {
-                dom::later(
-                    "session-poll",
-                    if length == 250 { 0 } else { 1000 },
-                    move || {
-                        spawn_local(async move {
-                            poll(epoch).await;
-                        })
-                    },
-                );
-            }
-        }
-        Ok(_) => {}
-        Err(e) if !e.aborted && epoch == m::read(|s| s.epoch) => {
-            dom::error("events-error", &e.message);
-            if (m::read(|s| m::active(&s.selected)) || inbox::watching(&sid))
-                && ![401, 403, 404].contains(&e.status)
-            {
-                dom::later("session-poll", 2500, move || {
-                    spawn_local(async move {
-                        poll(epoch).await;
-                    })
-                });
-            }
-        }
-        Err(_) => {}
-    }
-}
-pub fn apply_settings(v: &V) {
-    for (id, key) in [
-        ("provider", "provider"),
-        ("workflow", "workflow"),
-        ("mode", "mode"),
-        ("workspace", "workspace"),
-        ("agent-count", "agent_count"),
-    ] {
-        if !v[key].is_null() {
-            dom::set_value(id, &m::string(&v[key]));
-        }
-    }
-    dom::set_checked("agents-enabled", m::yes(&v["agents_enabled"]));
-    models("", Some(m::text(v, "model")));
-    dom::set_value("thinking-effort", &m::text(v, "thinking_effort"));
-    restore_model_routing(&v["model_routing"]);
-    dom::set_value("sdd-feature", &m::text(&v["sdd"], "feature"));
-    dom::set_value("sdd-phase", v["sdd"]["phase"].as_str().unwrap_or("specify"));
-    let revision = format!("{}:{}", m::text(v, "id"), m::string(&v["budget_revision"]));
-    if m::data("budget-revision") != revision {
-        restore_budgets("session-budgets", &v["budgets"]);
-        if v["fleet"].is_object() {
-            dom::set_checked("fleet-dry-run", m::yes(&v["fleet"]["dry_run"]));
-            dom::set_value("fleet-budget", &m::string(&v["fleet"]["budget_usd"]));
-            dom::set_value(
-                "fleet-worker-timeout",
-                &m::string(&v["fleet"]["worker_timeout"]),
-            );
-            for input in dom::all("#fleet-lenses input") {
-                let lens = dom::value_of(&input);
-                if let Some(input) = input.dyn_ref::<web_sys::HtmlInputElement>() {
-                    input.set_checked(
-                        m::array(&v["fleet"]["lenses"])
-                            .iter()
-                            .any(|value| value == &lens),
-                    );
-                }
-            }
-        }
-        m::set("budget-revision", json!(revision));
-    }
-    dom::set_checked("clash-enabled", v["clash"].is_object());
-    if v["clash"].is_object() {
-        dom::set_value("clash-challenger", &m::text(&v["clash"], "challenger"));
-        dom::set_value("clash-rounds", &m::string(&v["clash"]["rounds"]));
-        models("clash-", Some(m::text(&v["clash"], "challenger_model")));
-        dom::set_value(
-            "clash-thinking-effort",
-            &m::text(&v["clash"], "challenger_thinking_effort"),
-        );
-    }
-    dom::text("workspace-session-branch", &m::text(v, "branch"));
-    dom::text("workspace-session-path", &m::text(v, "project_path"));
-    run::outcomes(v);
-}
-fn base64(data: &[u8]) -> String {
-    const C: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut s = String::with_capacity(data.len().div_ceil(3) * 4);
-    for chunk in data.chunks(3) {
-        let n = ((chunk[0] as u32) << 16)
-            | ((chunk.get(1).copied().unwrap_or(0) as u32) << 8)
-            | (chunk.get(2).copied().unwrap_or(0) as u32);
-        s.push(C[((n >> 18) & 63) as usize] as char);
-        s.push(C[((n >> 12) & 63) as usize] as char);
-        s.push(if chunk.len() > 1 {
-            C[((n >> 6) & 63) as usize] as char
-        } else {
-            '='
-        });
-        s.push(if chunk.len() > 2 {
-            C[(n & 63) as usize] as char
-        } else {
-            '='
-        });
-    }
-    s
-}
-fn render_files() {
-    dom::clear("attachment-list");
-    FILES.with(|f| {
-        for (index, file) in f.borrow().iter().enumerate() {
-            let chip = dom::el("div", "attachment-chip", "");
-            dom::add(
-                &chip,
-                &dom::el(
-                    "span",
-                    "",
-                    &format!("{} · {} bytes", file.name(), file.size()),
-                ),
-            );
-            let remove = dom::button("×", "attachment-remove", json!(index));
-            let _ = remove.set_attribute("aria-label", &format!("Remove {}", file.name()));
-            dom::add(&chip, &remove);
-            dom::append("attachment-list", &chip);
-        }
-    });
-    dom::hidden("attachment-list", FILES.with(|f| f.borrow().is_empty()));
-}
-fn clear_files() {
-    close_task_context();
-    FILES.with(|f| f.borrow_mut().clear());
-    dom::set_value("attachment-input", "");
-    render_files();
-}
-fn add_files() {
-    if let Some(input) =
-        dom::get("attachment-input").and_then(|e| e.dyn_into::<web_sys::HtmlInputElement>().ok())
-    {
-        if let Some(files) = input.files() {
-            let chosen: Vec<_> = (0..files.length()).filter_map(|i| files.item(i)).collect();
-            input.set_value("");
-            stage_files(chosen, "attachment-error");
-        }
-    }
-}
-fn stage_files(files: impl IntoIterator<Item = web_sys::File>, error: &str) -> bool {
-    let mut all = FILES.with(|f| f.borrow().clone());
-    all.extend(files);
-    if all.len() > 5
-        || all.iter().any(|f| f.size() > 4194304.)
-        || all.iter().map(|f| f.size()).sum::<f64>() > 8388608.
-    {
-        dom::error(
-            error,
-            "Choose up to 5 files, at most 4 MiB each and 8 MiB total.",
-        );
-        return false;
-    }
-    FILES.with(|f| *f.borrow_mut() = all);
-    dom::error(error, "");
-    dom::error("attachment-error", "");
-    render_files();
-    true
-}
-
-fn task_context_available() -> bool {
-    let project = dom::value("project");
-    !project.is_empty()
-        && !dom::checked("clash-enabled")
-        && dom::value("workflow") != "fleet-review"
-        && !m::data("merge-draft").is_object()
-        && !inbox::needs_confirmation()
-        && m::read(|s| {
-            !s.boot.is_null()
-                && !s.auth_failed
-                && !s.pending
-                && (s.sid.is_empty() || merge_source_eligible(&s.selected, &project))
-        })
-}
-
-fn task_context_owner() -> V {
-    let (sid, epoch) = m::read(|s| (s.sid.clone(), s.epoch));
-    json!({"project":dom::value("project"),"sid":sid,"epoch":epoch})
-}
-
-fn task_context_current() -> bool {
-    dom::get("task-context-picker").is_some_and(|dialog| dialog.has_attribute("open"))
-        && m::data("task-context-owner") == task_context_owner()
-        && task_context_available()
-}
-
-fn close_task_context() {
-    m::next("task-context-request");
-    m::take("task-context-owner");
-    m::take("task-context-meta");
-    dom::dialog("task-context-picker", false);
-}
-
-/// The attachment name and character bound the draft for `source` came with.
-fn task_context_meta(source: &str) -> (String, usize) {
-    let meta = m::data("task-context-meta");
-    let current = !source.is_empty() && meta["source"] == source;
-    let name = meta["name"]
-        .as_str()
-        .filter(|_| current)
-        .map_or_else(|| format!("task-context-{source}.md"), str::to_owned);
-    let limit = meta["limit"]
-        .as_u64()
-        .filter(|limit| current && (1..=65536).contains(limit))
-        .map_or(TASK_CONTEXT_LIMIT, |limit| limit as usize);
-    (name, limit)
-}
-
-fn task_context_staged(name: &str) -> bool {
-    FILES.with(|files| files.borrow().iter().any(|file| file.name() == name))
-}
-
-async fn open_task_context() {
-    if !task_context_available() {
-        return;
-    }
-    let owner = task_context_owner();
-    m::set("task-context-owner", owner.clone());
-    let request = m::next("task-context-request");
-    dom::options("task-context-source", &[], |_| String::new(), Some(""));
-    dom::disabled("task-context-source", true);
-    dom::set_value("task-context-draft", "");
-    dom::disabled("task-context-draft", true);
-    dom::disabled("task-context-attach", true);
-    dom::error("task-context-error", "");
-    dom::text("task-context-status", "Loading tasks…");
-    dom::dialog("task-context-picker", true);
-    let sessions = api::get("/api/sessions").await;
-    if !m::current("task-context-request", request) || !task_context_current() {
-        return;
-    }
-    dom::text("task-context-status", "");
-    match sessions {
-        Ok(sessions) => {
-            let choices: Vec<_> = m::array(&sessions["sessions"])
-                .into_iter()
-                .filter(|chat| {
-                    chat["id"] != owner["sid"]
-                        && chat["status"] == "completed"
-                        && merge_source_eligible(chat, owner["project"].as_str().unwrap_or(""))
-                })
-                .collect();
-            let any = !choices.is_empty();
-            let mut options = vec![
-                json!({"id":"","label":if any {"Choose a task"} else {"No other finished tasks"}}),
-            ];
-            options.extend(choices);
-            dom::options(
-                "task-context-source",
-                &options,
-                |chat| {
-                    if chat["id"] == "" {
-                        m::text(chat, "label")
-                    } else {
-                        let short_id: String = m::text(chat, "id").chars().take(8).collect();
-                        format!("{} · {short_id}", m::summary(chat))
-                    }
-                },
-                Some(""),
-            );
-            dom::disabled("task-context-source", !any);
-            if any {
-                dom::focus("task-context-source");
-            }
-        }
-        Err(error) => dom::error("task-context-error", &error.message),
-    }
-}
-
-async fn prepare_task_context(source: &str) {
-    if !task_context_current() {
-        return;
-    }
-    let request = m::next("task-context-request");
-    m::take("task-context-meta");
-    dom::set_value("task-context-draft", "");
-    dom::disabled("task-context-draft", true);
-    dom::disabled("task-context-attach", true);
-    dom::error("task-context-error", "");
-    dom::text("task-context-status", "");
-    if source.is_empty() {
-        return;
-    }
-    dom::text("task-context-status", "Preparing draft…");
-    let owner = task_context_owner();
-    let mut url = format!(
-        "/api/sessions/{}/context-draft?project_id={}",
-        dom::enc(source),
-        dom::enc(&m::text(&owner, "project"))
-    );
-    if owner["sid"] != "" {
-        url.push_str(&format!(
-            "&destination_id={}",
-            dom::enc(&m::text(&owner, "sid"))
-        ));
-    }
-    let reply = api::get(&url).await;
-    if !m::current("task-context-request", request)
-        || !task_context_current()
-        || dom::value("task-context-source") != source
-    {
-        return;
-    }
-    dom::text("task-context-status", "");
-    match reply {
-        Ok(reply) if reply["draft"].is_string() => {
-            m::set(
-                "task-context-meta",
-                json!({"source":source,"name":reply["name"],"limit":reply["limit"]}),
-            );
-            let (_, limit) = task_context_meta(source);
-            dom::attr("task-context-draft", "maxlength", &limit.to_string());
-            dom::set_value("task-context-draft", &m::text(&reply, "draft"));
-            dom::disabled("task-context-draft", false);
-            task_context_draft_changed();
-        }
-        Ok(_) => dom::error(
-            "task-context-error",
-            "This task did not return a context draft.",
-        ),
-        Err(error) => dom::error("task-context-error", &error.message),
-    }
-}
-
-fn task_context_draft_changed() {
-    let source = dom::value("task-context-source");
-    let draft = dom::value("task-context-draft");
-    let (name, limit) = task_context_meta(&source);
-    let count = draft.chars().count();
-    let duplicate = !source.is_empty() && task_context_staged(&name);
-    dom::text(
-        "task-context-status",
-        &format!("{count} / {limit} characters"),
-    );
-    dom::error(
-        "task-context-error",
-        if duplicate { TASK_CONTEXT_ATTACHED } else { "" },
-    );
-    dom::disabled(
-        "task-context-attach",
-        duplicate || draft.trim().is_empty() || count > limit,
-    );
-}
-
-fn attach_task_context() {
-    if !task_context_current() {
-        close_task_context();
-        return;
-    }
-    let source = dom::value("task-context-source");
-    let draft = dom::value("task-context-draft");
-    let (name, limit) = task_context_meta(&source);
-    if source.is_empty() || draft.trim().is_empty() || draft.chars().count() > limit {
-        return;
-    }
-    if task_context_staged(&name) {
-        dom::error("task-context-error", TASK_CONTEXT_ATTACHED);
-        return;
-    }
-    let content = js_sys::Array::new();
-    content.push(&JsValue::from_str(&draft));
-    match web_sys::File::new_with_str_sequence(&content, &name) {
-        Ok(file) => {
-            if stage_files([file], "task-context-error") {
-                close_task_context();
-                dom::focus("prompt");
-            }
-        }
-        Err(_) => dom::error(
-            "task-context-error",
-            "Could not create the context attachment.",
-        ),
-    }
-}
-
-pub async fn send() {
-    if inbox::needs_confirmation() || m::read(|s| m::active(&s.selected)) {
-        if FILES.with(|files| !files.borrow().is_empty()) {
-            dom::error(
-                "composer-error",
-                "Remove attachments before queueing a plain-text next message.",
-            );
-        } else {
-            inbox::submit().await;
-        }
-        return;
-    }
-    if m::read(|s| s.pending || s.auth_failed || s.boot.is_null() || m::active(&s.selected))
-        || !dom::validity("session-form")
-    {
-        return;
-    }
-    let draft = m::data("merge-draft");
-    let (selected, selection_epoch) = m::read(|s| (s.sid.clone(), s.epoch));
-    if draft.is_object()
-        && !merge_draft_owned(&draft, &selected, &dom::value("project"), selection_epoch)
-    {
-        m::take("merge-draft");
-        reset_merge_archive();
-        controls();
-        dom::error(
-            "composer-error",
-            "The selected project or chat changed. Choose the chats to merge again.",
-        );
-        return;
-    }
-    let prompt = dom::value("prompt").trim().to_owned();
-    if prompt.is_empty() {
-        return;
-    }
-    if !budget_fields_valid("session-budgets") || !valid_budgets(&budgets("session-budgets")) {
-        dom::error(
-            "session-budgets-error",
-            "Use valid money, token and time limits.",
-        );
-        return;
-    }
-    let sid = m::read(|s| s.sid.clone());
-    let follow = !sid.is_empty();
-    if !follow
-        && m::data("merge-draft").is_object()
-        && (dom::value("workflow") != "native"
-            || dom::value("workspace") != "project"
-            || dom::checked("clash-enabled")
-            || FILES.with(|f| !f.borrow().is_empty()))
-    {
-        dom::error("composer-error","A merged task uses an ordinary native chat in the project folder, without attachments or Clash.");
-        return;
-    }
-    if !follow {
-        let strict = dom::checked("brain-link-review") || dom::value("brain-link-kind") != "auto";
-        let meta = m::data("brain-link-meta");
-        if strict && (!m::yes(&meta["runtime_available"]) || meta["mode"] != "governed") {
-            dom::error(
-                "brain-link-error",
-                "Choose a governed knowledge root before preparing a linked task.",
-            );
-            return;
-        }
-        if m::yes(&m::data("brain-link-loading")) {
-            dom::error(
-                "brain-link-error",
-                "Wait for knowledge roots to finish loading.",
-            );
-            return;
-        }
-    }
-    let workflow = dom::value("workflow");
-    if workflow == "sdd"
-        && !m::sdd_settings_valid(
-            dom::value("sdd-feature").trim(),
-            &dom::value("sdd-phase"),
-            &m::read(|s| m::array(&s.boot["sdd_phases"])),
-        )
-    {
-        dom::error(
-            "sdd-error",
-            "Choose a valid feature slug and SDD phase before sending.",
-        );
-        return;
-    }
-    let dry = workflow == "fleet-review" && dom::checked("fleet-dry-run");
-    let mut turn = json!({"prompt":prompt,"agents_enabled":dom::checked("agents-enabled"),"agent_count":dom::num("agent-count"),"model_routing":routing(),"model":if dry{V::Null}else{selected_model("")},"thinking_effort":if dry{V::Null}else{nullable(dom::value("thinking-effort"))}});
-    if follow && workflow == "native" && !routing().is_null() {
-        turn["mode"] = json!(dom::value("mode"));
-    }
-    if workflow == "sdd" {
-        turn["sdd"] =
-            json!({"feature":dom::value("sdd-feature").trim(),"phase":dom::value("sdd-phase")});
-    }
-    if dom::checked("clash-enabled") {
-        turn["clash"] = json!({"challenger":dom::value("clash-challenger"),"rounds":dom::num("clash-rounds"),"challenger_model":selected_model("clash-"),"challenger_thinking_effort":nullable(dom::value("clash-thinking-effort"))});
-    } else if follow {
-        turn["clash"] = V::Null;
-    }
-    if !follow {
-        for (k, v) in [
-            ("budgets", budgets("session-budgets")),
-            ("project_id", json!(dom::value("project"))),
-            ("provider", json!(dom::value("provider"))),
-            ("mode", json!(dom::value("mode"))),
-            ("workflow", json!(workflow)),
-            ("project_context", json!(true)),
-            ("workspace", json!(dom::value("workspace"))),
-        ] {
-            turn[k] = v;
-        }
-        if dom::value("workspace") == "worktree" && !dom::value("worktree-branch").trim().is_empty()
-        {
-            turn["worktree_branch"] = json!(dom::value("worktree-branch").trim());
-        }
-        if dom::value("workspace") == "existing-worktree" {
-            turn["worktree_id"] = json!(dom::value("existing-worktree"));
-        }
-        if workflow == "fleet-review" {
-            turn["fleet"] = json!({"lenses":dom::selected_checks("fleet-lenses"),"dry_run":dom::checked("fleet-dry-run"),"budget_usd":dom::num("fleet-budget"),"worker_timeout":dom::num("fleet-worker-timeout")});
-        }
-    }
-    m::write(|s| s.pending = true);
-    controls();
-    let files = FILES.with(|f| f.borrow().clone());
-    let mut encoded = vec![];
-    for file in files {
-        match JsFuture::from(file.array_buffer()).await {
-            Ok(a) => encoded.push(
-                json!({"name":file.name(),"data":base64(&js_sys::Uint8Array::new(&a).to_vec())}),
-            ),
-            Err(_) => {
-                dom::error(
-                    "attachment-error",
-                    &format!("Could not read {}. Attach it again.", file.name()),
-                );
-                m::write(|s| s.pending = false);
-                controls();
-                return;
-            }
-        }
-    }
-    if !encoded.is_empty() {
-        turn["attachments"] = json!(encoded);
-    }
-    let draft = m::data("merge-draft");
-    let path;
-    if !follow && draft.is_object() {
-        let signature = turn.to_string();
-        let mut draft = draft;
-        if draft["signature"].is_string() && draft["signature"] != signature {
-            draft["request_id"] = json!(m::request_identity());
-        }
-        draft["signature"] = json!(signature);
-        let body = json!({"source_ids":draft["sources"],"request_id":draft["request_id"],"destination":turn});
-        m::set("merge-draft", draft);
-        turn = body;
-        path = "/api/sessions/merge".into();
-    } else {
-        path = if follow {
-            format!("/api/sessions/{}/messages", dom::enc(&sid))
-        } else {
-            "/api/sessions".into()
-        };
-    }
-    m::write(|s| s.pending = true);
-    controls();
-    dom::error("composer-error", "");
-    match api::post(&path, turn).await {
-        Ok(v) => {
-            let session = &v["session"];
-            if !follow && !session["id"].is_string() {
-                dom::error(
-                    "composer-error",
-                    "No session returned. Refresh the list before retrying.",
-                );
-            } else {
-                m::upsert(session.clone());
-                if follow {
-                    inbox::clear_draft(&sid, &prompt);
-                }
-                dom::set_value("prompt", "");
-                clear_files();
-                m::write(|s| s.pending = false);
-                if follow {
-                    let e = m::read(|s| s.epoch);
-                    poll(e).await;
-                } else {
-                    m::take("merge-draft");
-                    select(&m::text(session, "id")).await;
-                }
-            }
-        }
-        Err(e) => dom::error("composer-error", &e.message),
-    }
-    m::write(|s| s.pending = false);
-    controls();
-}
-pub async fn session_action(action: &str, body: V, error: &str) {
-    let sid = m::read(|s| s.sid.clone());
-    if sid.is_empty() || m::read(|s| s.pending) {
-        return;
-    }
-    stop_poll();
-    m::write(|s| s.pending = true);
-    controls();
-    match api::post(
-        &format!("/api/sessions/{}/{}", dom::enc(&sid), action),
-        body,
-    )
-    .await
-    {
-        Ok(v) => {
-            if v["session"].is_object() {
-                m::upsert(v["session"].clone());
-            }
-        }
-        Err(e) => dom::error(error, &e.message),
-    }
-    m::write(|s| s.pending = false);
-    let e = m::read(|s| s.epoch);
-    poll(e).await;
-    controls();
-}
-pub async fn load_git() {
-    let p = dom::value("project");
-    if p.is_empty() {
-        return;
-    }
-    for kind in ["git", "worktrees"] {
-        let path = format!("/api/projects/{}/{kind}", dom::enc(&p));
-        if let Ok((e, v)) = api::scoped(&format!("project-{kind}"), &path).await {
-            if !m::current(&format!("project-{kind}"), e) || dom::value("project") != p {
-                continue;
-            }
-            m::set(&format!("project-{kind}"), v.clone());
-            if kind == "git" {
-                dom::text("project-git-status", &m::summary(&v));
-            } else {
-                dom::options(
-                    "existing-worktree",
-                    &m::array(&v["worktrees"]),
-                    |v| format!("{} · {}", m::text(v, "branch"), m::text(v, "path")),
-                    None,
-                );
-            }
-        }
-    }
-}
-pub async fn sign_in(refresh: bool) {
-    if m::read(|s| s.boot.is_null() || s.auth_failed) || m::yes(&m::data("sign-in-pending")) {
-        return;
-    }
-    let fresh = if refresh { 3000. } else { 30000. };
-    if m::data("sign-in-at")
-        .as_f64()
-        .is_some_and(|at| js_sys::Date::now() - at < fresh)
-    {
-        return;
-    }
-    m::set("sign-in-pending", json!(true));
-    let path = format!(
-        "/api/providers/sign-in{}",
-        if refresh { "?refresh=1" } else { "" }
-    );
-    if let Ok(mut v) = api::get(&path).await {
-        let mut states = json!({});
-        for provider in m::array(&v["providers"]) {
-            if let Some(id) = provider["id"].as_str() {
-                states[id] = provider.clone();
-            }
-        }
-        v["states"] = states;
-        let chosen = dom::value("provider");
-        let state = &v["states"][&chosen];
-        let note = if state["state"] == "signed_out" {
-            format!(
-                "{} is not signed in. Sign in from a terminal with {}, then send again.",
-                m::summary(&m::provider(&chosen)),
-                state["login"].as_str().unwrap_or("the provider CLI")
-            )
-        } else {
-            String::new()
-        };
-        dom::text("provider-hint", &note);
-        m::set("sign-in", v);
-        m::set("sign-in-at", json!(js_sys::Date::now()));
-    }
-    m::set("sign-in-pending", json!(false));
-}
-// Updates of this clone, offered as desktop applications offer theirs: an Update button in the
-// header while the branch the clone follows has moved on. A click fast-forwards the clone and
-// restarts the server, and the page reloads itself on the new version. "app-update" holds the
-// server's status (updates.rs), "app-update-page" what this page did: pending, restarting,
-// failed, its note and the server instance that answered before the update.
-pub async fn update_status(check: bool) {
-    let page = m::data("app-update-page");
-    if !(m::yes(&page["pending"])
-        || m::yes(&page["restarting"])
-        || m::read(|s| s.boot.is_null() || s.auth_failed))
-    {
-        if let Ok(v) = api::get(&format!(
-            "/api/app/update{}",
-            if check { "?check=1" } else { "" }
-        ))
-        .await
-        {
-            let unsupported = v["supported"] == false;
-            m::set("app-update", v);
-            render_update();
-            if unsupported {
-                return;
-            }
-        }
-        if check {
-            // A check fetches in the background: its answer is read once it has had time to arrive.
-            dom::later("app-update-read", 8000, || {
-                spawn_local(async {
-                    update_status(false).await;
-                })
-            });
-        }
-    }
-    dom::later("app-update", 600000, || {
-        spawn_local(async {
-            update_status(true).await;
-        })
-    });
-}
-#[derive(Debug, PartialEq)]
-struct UpdateView {
-    button: bool,
-    busy: bool,
-    label: &'static str,
-    title: String,
-    note: String,
-    error: bool,
-}
-fn update_view(status: &V, page: &V) -> UpdateView {
-    let state = status["state"].as_str().unwrap_or("");
-    let (pending, restarting) = (m::yes(&page["pending"]), m::yes(&page["restarting"]));
-    let mut title = vec![];
-    if state == "available" {
-        let commits = m::array(&status["commits"]);
-        let shown = commits.len().min(10);
-        title.push(m::text(status, "detail"));
-        title.extend(
-            commits[..shown]
-                .iter()
-                .map(|commit| format!("• {}", m::text(commit, "subject"))),
-        );
-        let more = status["behind"]
-            .as_u64()
-            .unwrap_or(0)
-            .saturating_sub(shown as u64);
-        if more > 0 {
-            title.push(format!("… and {more} more"));
-        }
-    }
-    let note = m::text(page, "note");
-    let (note, error) = if !note.is_empty() {
-        (note, m::yes(&page["failed"]))
-    } else if ["diverged", "failed", "restart-required"].contains(&state) {
-        (m::text(status, "detail"), state != "diverged")
-    } else {
-        (String::new(), false)
-    };
-    UpdateView {
-        // A restart the server refused is pressed again once the clone is rebuilt.
-        button: pending || restarting || ["available", "restart-required"].contains(&state),
-        busy: pending || restarting,
-        label: if restarting {
-            "Restarting…"
-        } else if pending {
-            "Updating…"
-        } else {
-            "Update"
-        },
-        title: title
-            .into_iter()
-            .filter(|line| !line.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        note,
-        error,
-    }
-}
-/// The pieces of a server note, `true` for a command it quotes in backticks.
-fn code_spans(note: &str) -> Vec<(bool, &str)> {
-    let pieces = note.split('`').collect::<Vec<_>>();
-    if pieces.len() % 2 == 0 {
-        return vec![(false, note)];
-    }
-    pieces
-        .into_iter()
-        .enumerate()
-        .filter(|(_, piece)| !piece.is_empty())
-        .map(|(index, piece)| (index % 2 == 1, piece))
-        .collect()
-}
-fn render_update() {
-    let view = update_view(&m::data("app-update"), &m::data("app-update-page"));
-    dom::hidden("app-update", !view.button);
-    dom::disabled("app-update", view.busy);
-    dom::text("app-update", view.label);
-    dom::attr("app-update", "title", &view.title);
-    // Rewritten only when it changes, so the status region is not announced again.
-    if let Some(note) = dom::get("app-update-note") {
-        if note.get_attribute("data-note").as_deref() != Some(view.note.as_str()) {
-            note.set_text_content(None);
-            for (code, piece) in code_spans(&view.note) {
-                if code {
-                    dom::add(&note, &dom::el("code", "", piece));
-                } else {
-                    let _ = note.append_with_str_1(piece);
-                }
-            }
-            let _ = note.set_attribute("data-note", &view.note);
-        }
-    }
-    dom::hidden("app-update-banner", view.note.is_empty());
-    dom::class("app-update-banner", "error", view.error);
-}
-async fn apply_update() {
-    let page = m::data("app-update-page");
-    if m::yes(&page["pending"]) || m::yes(&page["restarting"]) {
-        return;
-    }
-    m::set("app-update-page", json!({"pending":true}));
-    render_update();
-    // The restarted server answers health with another instance.
-    let result = match api::get("/api/health").await {
-        Ok(health) => api::post("/api/app/update", json!({}))
-            .await
-            .map(|v| (health["instance"].clone(), v)),
-        Err(error) => Err(error),
-    };
-    let mut status = m::data("app-update");
-    let page = match result {
-        Ok((_, v)) if m::yes(&v["current"]) => {
-            status["state"] = "current".into();
-            json!({"note":v["detail"]})
-        }
-        Ok((instance, v)) => {
-            status["state"] = "updated".into();
-            let to = m::text(&v, "to");
-            let updated = if to.is_empty() {
-                "Updated.".to_owned()
-            } else {
-                format!("Updated to {to}.")
-            };
-            if m::yes(&v["restarting"]) {
-                json!({"restarting":true,"instance":instance,"note":format!("{updated} The Harness is restarting; this page reloads by itself.")})
-            } else {
-                json!({"note":format!("{updated} Restart the Harness to use it.")})
-            }
-        }
-        Err(error) => json!({"failed":true,"note":error.message}),
-    };
-    let (restarting, failed) = (m::yes(&page["restarting"]), m::yes(&page["failed"]));
-    m::set("app-update", status);
-    m::set("app-update-page", page);
-    render_update();
-    if restarting {
-        wait_for_restart(js_sys::Date::now() + 120000.);
-    } else if failed {
-        // The failure may have changed the server's state, such as a restart it now requires.
-        update_status(false).await;
-    }
-}
-fn wait_for_restart(deadline: f64) {
-    dom::later("app-restart", 1000, move || {
-        spawn_local(async move {
-            if let Ok(health) = api::get("/api/health").await {
-                if health["instance"].is_string()
-                    && health["instance"] != m::data("app-update-page")["instance"]
-                {
-                    let _ = dom::window().location().reload();
-                    return;
-                }
-            }
-            if js_sys::Date::now() < deadline {
-                wait_for_restart(deadline);
-            } else {
-                m::set(
-                    "app-update-page",
-                    json!({"failed":true,"note":"The Harness did not come back after the update. Start it again from the application icon."}),
-                );
-                render_update();
-            }
-        })
-    });
-}
-fn result_view() -> bool {
-    m::read(|s| ["changes", "checks", "usage"].contains(&s.view.as_str()))
-}
-fn reset_results() {
-    dom::cancel_timer("results-poll");
-    m::next("results");
-    m::take("results");
-    m::take("delivery");
-    invalidate_delivery();
-    dom::hidden("delivery-options", true);
-    dom::clear("delivery-files");
-    dom::set_value("delivery-message", "");
-    dom::clear("delivery-source");
-    dom::clear("delivery-target");
-    dom::text("delivery-status", "");
-}
-pub async fn results() {
-    dom::cancel_timer("results-poll");
-    if !result_view() {
-        return;
-    }
-    m::take("delivery");
-    invalidate_delivery();
-    dom::hidden("delivery-options", true);
-    result_controls();
-    let sid = m::read(|s| s.sid.clone());
-    if sid.is_empty() {
-        dom::error("results-error", "Choose a session first.");
-        return;
-    }
-    let key = "results";
-    let path = format!("/api/sessions/{}/results", dom::enc(&sid));
-    match api::scoped(key, &path).await {
-        Ok((e, v)) if m::current(key, e) && m::read(|s| s.sid == sid) && result_view() => {
-            m::set("results", v.clone());
-            let snapshot = &v["snapshot"];
-            dom::text("results-workspace", &m::text(&v, "workspace"));
-            dom::hidden(
-                "delivery-section",
-                m::read(|s| s.selected["workspace"] != "worktree"),
-            );
-            let checking = m::array(&v["checks"]).iter().any(m::active);
-            dom::text(
-                "results-status",
-                if checking {
-                    "Verification is queued or running; agent outcome stays separate."
-                } else if m::read(|s| m::active(&s.selected)) {
-                    "Agent is active. Refresh the diff after this launch finishes."
-                } else {
-                    "Verification results are current to the recorded snapshots."
-                },
-            );
-            dom::text(
-                "results-base",
-                &if snapshot["available"] == true {
-                    format!(
-                        "Branch: {} · Base: {}{}{}",
-                        snapshot["branch"].as_str().unwrap_or("detached HEAD"),
-                        m::text(snapshot, "base"),
-                        if snapshot["baseline_recorded"] == true {
-                            " (first launch)"
-                        } else {
-                            " (current HEAD; original baseline unavailable)"
-                        },
-                        if snapshot["preexisting_changes"] == true {
-                            " · Workspace already had uncommitted changes at first launch."
-                        } else {
-                            ""
-                        }
-                    )
-                } else {
-                    String::new()
-                },
-            );
-            dom::text(
-                "results-diff-note",
-                &format!(
-                    "{}{}",
-                    m::text(snapshot, "message"),
-                    if snapshot["available"] == true && snapshot["complete"] != true {
-                        " Preview is truncated or omits file contents; verification freshness cannot be certified."
-                    } else {
-                        ""
-                    }
-                ),
-            );
-            let files = m::array(&snapshot["files"])
-                .iter()
-                .map(|f| format!("{}  {}", m::text(f, "status"), m::text(f, "path")))
-                .collect::<Vec<_>>()
-                .join("\n");
-            dom::text(
-                "results-files",
-                if files.is_empty() {
-                    "No changed files listed."
-                } else {
-                    &files
-                },
-            );
-            dom::text(
-                "results-diff",
-                snapshot["diff"]
-                    .as_str()
-                    .unwrap_or("No text diff available."),
-            );
-            dom::text("results-usage-note", &m::text(&v, "notice"));
-            let totals = &v["totals"];
-            let amount = |key: &str, suffix: &str| {
-                let t = &totals[key];
-                if t["unknown_launches"].as_u64().unwrap_or(0) > 0
-                    && t["reported"].as_f64().unwrap_or(0.) == 0.
-                {
-                    "—".into()
-                } else {
-                    t["reported"]
-                        .as_f64()
-                        .map(|n| {
-                            if key == "cost_usd" {
-                                format!("≈ {}{n:.4}", "$")
-                            } else {
-                                format!("{n:.0}{suffix}")
-                            }
-                        })
-                        .unwrap_or_else(|| "—".into())
-                }
-            };
-            let unknown = ["tokens", "cost_usd"]
-                .iter()
-                .filter_map(|key| {
-                    totals[*key]["unknown_launches"]
-                        .as_u64()
-                        .filter(|n| *n > 0)
-                        .map(|n| {
-                            format!(
-                                "{} not reported for {n} launches",
-                                if *key == "cost_usd" { "cost" } else { "tokens" }
-                            )
-                        })
-                })
-                .collect::<Vec<_>>();
-            dom::text(
-                "results-totals",
-                &format!(
-                    "{} · {} · {}{}",
-                    amount("tokens", " tokens"),
-                    amount("cost_usd", ""),
-                    amount("seconds", " s"),
-                    if unknown.is_empty() {
-                        String::new()
-                    } else {
-                        format!(" · {}", unknown.join(" · "))
-                    }
-                ),
-            );
-            let checks = m::array(&v["checks"]);
-            dom::keyed_render(
-                "results-checks",
-                &checks,
-                |c| m::text(c, "id"),
-                |check| {
-                    let d = dom::details(
-                        &format!(
-                            "{} · {}",
-                            m::text(check, "status").to_uppercase(),
-                            m::text(check, "command")
-                        ),
-                        "",
-                    );
-                    if ["queued", "running", "failed", "timed_out", "output_limit"]
-                        .contains(&check["status"].as_str().unwrap_or(""))
-                    {
-                        let _ = d.set_attribute("open", "");
-                    }
-                    let current = snapshot["complete"] == true
-                        && check["snapshot_complete"] == true
-                        && snapshot["id"] == check["snapshot_id"]
-                        && check["workspace_changed"] != true;
-                    let freshness = if check["kind"] == "target" {
-                        format!(
-                            "Target {} · tested commit {}{}",
-                            m::text(check, "target_branch"),
-                            m::text(check, "candidate"),
-                            if check["workspace_changed"] == true {
-                                " · Check changed the workspace"
-                            } else {
-                                ""
-                            }
-                        )
-                    } else if current {
-                        "Matches the current diff".into()
-                    } else if check["workspace_changed"] == true
-                        || snapshot["id"].is_string()
-                            && check["snapshot_id"].is_string()
-                            && snapshot["id"] != check["snapshot_id"]
-                    {
-                        "Workspace changed since this check".into()
-                    } else {
-                        "Freshness unavailable".into()
-                    };
-                    dom::add(
-                        &d,
-                        &dom::el(
-                            "p",
-                            "knowledge-note",
-                            &format!(
-                                "{} · exit code {} · {}s · {freshness}",
-                                check["started_at"]
-                                    .as_str()
-                                    .or_else(|| check["created_at"].as_str())
-                                    .unwrap_or("not recorded"),
-                                check["exit_code"]
-                                    .as_i64()
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_else(|| "unavailable".into()),
-                                check["seconds"]
-                                    .as_f64()
-                                    .map(|n| n.to_string())
-                                    .unwrap_or_else(|| "unknown".into())
-                            ),
-                        ),
-                    );
-                    dom::add(
-                        &d,
-                        &dom::el(
-                            "pre",
-                            "fleet-report-text",
-                            check["output"]
-                                .as_str()
-                                .filter(|s| !s.is_empty())
-                                .unwrap_or("Waiting for output…"),
-                        ),
-                    );
-                    d
-                },
-            );
-            if checks.is_empty() {
-                dom::append(
-                    "results-checks",
-                    &dom::el("p", "knowledge-note", "No independent checks run yet."),
-                );
-            }
-            dom::rows("results-launches", &m::array(&v["launches"]));
-            delivery_load(&sid).await;
-            if !m::current(key, e) || !m::read(|s| s.sid == sid) || !result_view() {
-                return;
-            }
-            result_controls();
-            let view = m::read(|s| s.view.clone());
-            render_tabs(&view, "sessions");
-            if m::read(|s| m::active(&s.selected)) {
-                dom::later("results-poll", 1200, || {
-                    spawn_local(async {
-                        results().await;
-                    })
-                });
-            }
-        }
-        Ok(_) => {}
-        Err(e) if !e.aborted && m::read(|s| s.sid == sid) && result_view() => {
-            dom::error("results-error", &e.message)
-        }
-        Err(_) => {}
-    }
-}
-fn result_controls() {
-    let session = m::read(|s| s.selected.clone());
-    let locked =
-        m::read(|s| s.sid.is_empty() || s.pending || m::active(&s.selected) || s.auth_failed);
-    let result = m::data("results");
-    let command = dom::value("check-command");
-    let timeout = dom::num("check-timeout").as_f64();
-    let timeout_valid = timeout.is_some_and(|n| (1.0..=3600.).contains(&n) && n.fract() == 0.);
-    dom::disabled(
-        "check-start",
-        locked
-            || !result["snapshot"].is_object()
-            || session["creator"].is_object()
-            || command.trim().is_empty()
-            || command.len() > 4000
-            || !timeout_valid,
-    );
-    dom::disabled("check-command", locked || session["creator"].is_object());
-    dom::disabled("check-timeout", locked);
-    let delivery = m::data("delivery");
-    let preview = m::data("delivery-preview");
-    let delivery_locked = locked || delivery["available"] != true;
-    let message = dom::value("delivery-message");
-    let too_long = message.len() > 4000;
-    dom::error(
-        "delivery-message-error",
-        if too_long {
-            "Use a commit message of at most 4,000 UTF-8 bytes."
-        } else {
-            ""
-        },
-    );
-    for e in dom::all("#delivery-options input,#delivery-options select") {
-        if delivery_locked {
-            let _ = e.set_attribute("disabled", "");
-        } else {
-            let _ = e.remove_attribute("disabled");
-        }
-    }
-    dom::disabled(
-        "delivery-commit-preview-button",
-        delivery_locked
-            || dom::selected_checks("delivery-files").is_empty()
-            || message.trim().is_empty()
-            || too_long,
-    );
-    let require = dom::checked("delivery-check-required");
-    let check = dom::value("delivery-check-command");
-    let checktime = dom::num("delivery-check-timeout").as_f64();
-    let check_valid = !check.trim().is_empty()
-        && check.len() <= 4000
-        && checktime.is_some_and(|n| (1.0..=3600.).contains(&n) && n.fract() == 0.);
-    dom::disabled("delivery-check-command", delivery_locked || !require);
-    dom::disabled("delivery-check-timeout", delivery_locked || !require);
-    dom::disabled(
-        "delivery-preview-button",
-        delivery_locked
-            || dom::value("delivery-source").is_empty()
-            || dom::value("delivery-target").is_empty()
-            || require && !check_valid,
-    );
-    dom::disabled(
-        "delivery-commit",
-        delivery_locked || preview["kind"] != "commit" || preview["can_apply"] != true,
-    );
-    let check = &preview["target_check"];
-    dom::hidden("delivery-run-check", preview["check"].is_null());
-    dom::disabled(
-        "delivery-run-check",
-        delivery_locked || preview["check"].is_null() || preview["can_apply"] != true,
-    );
-    dom::hidden("delivery-cancel-check", !m::active(check));
-    dom::disabled("delivery-cancel-check", m::read(|s| s.pending));
-    dom::disabled(
-        "delivery-apply",
-        delivery_locked
-            || preview["kind"] != "transfer"
-            || preview["can_apply"] != true
-            || !preview["check"].is_null()
-                && (check["status"] != "passed"
-                    || check["workspace_changed"] == true
-                    || check["candidate"] != preview["candidate"]),
-    );
-}
-async fn delivery_load(sid: &str) {
-    let key = "delivery";
-    let response = api::scoped(key, &format!("/api/sessions/{}/delivery", dom::enc(sid))).await;
-    if let Ok((epoch, v)) = response {
-        if !m::current(key, epoch) || !m::read(|s| s.sid == sid) || !result_view() {
-            return;
-        }
-        m::set("delivery", v.clone());
-        dom::hidden(
-            "delivery-options",
-            !m::yes(&v["available"]) && !v["preview"].is_object(),
-        );
-        dom::text(
-            "delivery-availability",
-            v["notice"]
-                .as_str()
-                .or_else(|| v["reason"].as_str())
-                .unwrap_or(""),
-        );
-        dom::clear("delivery-files");
-        for file in m::array(&v["files"]) {
-            dom::append(
-                "delivery-files",
-                &dom::check(
-                    &format!("{} · {}", m::text(&file, "path"), m::text(&file, "status")),
-                    "delivery-file",
-                    &m::text(&file, "path"),
-                    false,
-                ),
-            );
-        }
-        let mut commits = vec![json!({"id":"","name":"Choose a commit"})];
-        commits.extend(m::array(&v["commits"]).into_iter().map(|x|json!({"id":x["sha"],"name":format!("{} · {}",m::text(&x,"sha"),m::text(&x,"subject"))})));
-        dom::options("delivery-source", &commits, m::summary, None);
-        let mut branches = vec![json!({"id":"","name":"Choose a local branch"})];
-        branches.extend(
-            m::array(&v["branches"])
-                .into_iter()
-                .map(|x| json!({"id":x["name"],"name":x["name"]})),
-        );
-        dom::options("delivery-target", &branches, m::summary, None);
-        if v["preview"].is_object() {
-            render_delivery(&v["preview"]);
-        }
-        result_controls();
-    }
-}
-fn render_delivery(v: &V) {
-    m::set("delivery-preview", v.clone());
-    let prefix = if v["kind"] == "commit" {
-        "delivery-commit"
-    } else {
-        "delivery-preview"
-    };
-    dom::hidden(
-        if prefix == "delivery-commit" {
-            "delivery-commit-preview"
-        } else {
-            "delivery-preview"
-        },
-        false,
-    );
-    dom::text(
-        &format!("{prefix}-summary"),
-        &format!("{} · {}", m::summary(v), m::text(v, "candidate")),
-    );
-    dom::rows(&format!("{prefix}-files"), &m::array(&v["files"]));
-    dom::text(&format!("{prefix}-diff"), &m::text(v, "diff"));
-    dom::pretty(&format!("{prefix}-checks"), &v["checks"]);
-    dom::text(
-        &format!("{prefix}-note"),
-        v["notice"]
-            .as_str()
-            .unwrap_or("Review the files and diff before confirming."),
-    );
-    dom::disabled(
-        "delivery-commit",
-        !m::yes(&v["can_apply"]) || v["kind"] != "commit",
-    );
-    dom::disabled(
-        "delivery-apply",
-        !m::yes(&v["can_apply"]) || v["kind"] == "commit",
-    );
-    dom::text("delivery-check-status", &m::summary(&v["target_check"]));
-    dom::text(
-        "delivery-check-output",
-        &m::text(&v["target_check"], "output"),
-    );
-}
-fn invalidate_delivery() {
-    m::next("delivery");
-    m::take("delivery-preview");
-    dom::hidden("delivery-preview", true);
-    dom::hidden("delivery-commit-preview", true);
-    dom::disabled("delivery-commit", true);
-    dom::disabled("delivery-apply", true);
-}
-async fn delivery(action: &str, body: V) {
-    let sid = m::read(|s| s.sid.clone());
-    if sid.is_empty() || m::read(|s| s.pending) {
-        return;
-    }
-    m::write(|s| s.pending = true);
-    controls();
-    invalidate_delivery();
-    let mut body = body;
-    body["action"] = json!(action);
-    match api::post(&format!("/api/sessions/{}/delivery", dom::enc(&sid)), body).await {
-        Ok(v) => {
-            if action == "check" {
-                if v["session"].is_object() {
-                    m::upsert(v["session"].clone());
-                }
-                results().await;
-            } else if ["commit", "apply"].contains(&action) {
-                dom::text(
-                    "delivery-status",
-                    &format!(
-                        "{} · Commit {}",
-                        m::text(&v, "detail"),
-                        m::text(&v, "commit")
-                    ),
-                );
-                results().await;
-            } else {
-                render_delivery(&v);
-            }
-        }
-        Err(e) => dom::error(
-            "delivery-error",
-            &format!(
-                "{} Refresh results and prepare a new preview before retrying.",
-                e.message
-            ),
-        ),
-    }
-    m::write(|s| s.pending = false);
-    controls();
-}
-fn resize(height: f64) {
-    let available = dom::get("sessions-view")
-        .map(|e| e.client_height())
-        .unwrap_or(500) as f64
-        - dom::get("composer-area")
-            .map(|e| e.client_height())
-            .unwrap_or(0) as f64
-        - dom::get("run-view").map(|e| e.client_height()).unwrap_or(0) as f64
-        - 100.;
-    let h = height.max(80.).min(available.max(80.));
-    if let Some(e) =
-        dom::get("sessions-view").and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
-    {
-        let _ = e
-            .style()
-            .set_property("--configuration-height", &format!("{h}px"));
-        let _ = e.class_list().add_1("output-resized");
-    }
-    m::set("output-height", json!(height));
-}
-pub fn resize_key(event: &web_sys::KeyboardEvent) {
-    if event
-        .target()
-        .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
-        .map(|e| e.id())
-        .as_deref()
-        != Some("output-resizer")
-    {
-        return;
-    }
-    let h = m::data("output-height").as_f64().unwrap_or(200.);
-    let next = match event.key().as_str() {
-        "ArrowUp" => h - 40.,
-        "ArrowDown" => h + 40.,
-        "Home" => 80.,
-        "End" => dom::get("sessions-view")
-            .map(|e| e.client_height())
-            .unwrap_or(500) as f64,
-        _ => return,
-    };
-    event.prevent_default();
-    resize(next);
-}
-pub fn resize_event(kind: &str, event: &web_sys::Event) {
-    let Some(target) = event
-        .target()
-        .and_then(|e| e.dyn_into::<web_sys::Element>().ok())
-    else {
-        return;
-    };
-    if target.id() != "output-resizer" {
-        return;
-    }
-    if kind == "dblclick" {
-        dom::class("sessions-view", "output-resized", false);
-        return;
-    }
-    let Some(p) = event.dyn_ref::<web_sys::PointerEvent>() else {
-        return;
-    };
-    match kind {
-        "pointerdown" if p.button() == 0 => {
-            let _ = target.set_pointer_capture(p.pointer_id());
-            dom::focus("output-resizer");
-            event.prevent_default();
-        }
-        "pointermove" if target.has_pointer_capture(p.pointer_id()) => {
-            let top = dom::document()
-                .query_selector("#sessions-view .configuration")
-                .ok()
-                .flatten()
-                .map(|e| e.get_bounding_client_rect().top())
-                .unwrap_or(0.);
-            resize(p.client_y() as f64 - top);
-        }
-        "pointerup" | "pointercancel" => {
-            let _ = target.release_pointer_capture(p.pointer_id());
-        }
-        _ => {}
-    }
+    refresh_provider_hint();
+    sync_working_indicator();
 }
 pub async fn event(
     kind: &str,
@@ -2600,10 +1529,39 @@ pub async fn event(
     value: &str,
     checked: bool,
 ) -> bool {
+    if kind == "input" && id == "history-search" {
+        m::write(|s| s.workspace.history_query = value.to_owned());
+        history();
+        return true;
+    }
     if kind == "input" && id == "prompt" {
-        save_preferences();
-        controls();
+        schedule_save_preferences();
+        update_send_control();
+        let ready = m::read(|s| !s.boot.is_null() && !s.auth_failed && !m::active(&s.selected));
+        if ready && !dom::value("project").is_empty() && has_at_file_mention(value) {
+            dom::later("preflight-debounce", 600, || {
+                spawn_local(async {
+                    run_preflight(false).await;
+                });
+            });
+        } else {
+            dom::cancel_timer("preflight-debounce");
+        }
         return false;
+    }
+    if (kind == "input" || kind == "change")
+        && (id.starts_with("results-memory-") || action == "results-memory-field")
+    {
+        m::set("results-memory-dirty", json!(true));
+        dom::error("results-memory-error", "");
+        result_controls();
+        return true;
+    }
+    if kind == "change" && id == "preflight-risk-callers" {
+        if m::data("preflight").is_object() {
+            run_preflight(true).await;
+        }
+        return true;
     }
     if (kind == "input" || kind == "change")
         && (id.starts_with("delivery-") || action == "delivery-file")
@@ -2616,18 +1574,27 @@ pub async fn event(
         result_controls();
         return true;
     }
+    if (kind == "input" || kind == "change")
+        && id == "session-graph-filter"
+        && crate::graph_map::handle_session_graph_input(id, value, None)
+    {
+        return true;
+    }
+    if (kind == "input" || kind == "change")
+        && id == "session-graph-notests"
+        && crate::graph_map::handle_session_graph_input(id, value, Some(checked))
+    {
+        return true;
+    }
     if kind == "change" && action == "merge-choice" {
         let n = dom::selected_checks("merge-options").len();
         dom::text("merge-selection-count", &format!("{n} chats selected"));
         dom::disabled("merge-picker-continue", !(2..=8).contains(&n));
         return true;
     }
-    if kind == "change" && id == "task-context-source" {
-        prepare_task_context(value).await;
-        return true;
-    }
-    if kind == "input" && id == "task-context-draft" {
-        task_context_draft_changed();
+    if kind == "change" && action == "omnigraph-peer-choice" {
+        omnigraph::sync_peer_draft_from_dom();
+        controls();
         return true;
     }
     if kind == "change" {
@@ -2635,8 +1602,7 @@ pub async fn event(
             if value == "__choose-folder__" {
                 management::folder_open("session").await;
             } else {
-                new_session(Some(value));
-                load_git().await;
+                switch_project_from_shell(value).await;
             }
             return true;
         }
@@ -2666,7 +1632,9 @@ pub async fn event(
                 for prefix in ["routing-plan-", "routing-edit-"] {
                     models(prefix, Some(String::new()));
                 }
+                refresh_provider_hint();
             }
+            mark_dirty_for_id(id);
             controls();
             save_preferences();
             return true;
@@ -2676,8 +1644,7 @@ pub async fn event(
             return true;
         }
         if action == "theme"
-            || dom::get(id)
-                .is_some_and(|e| e.get_attribute("name").as_deref() == Some("theme"))
+            || dom::get(id).is_some_and(|e| e.get_attribute("name").as_deref() == Some("theme"))
         {
             dom::save(
                 "harness.theme.v1",
@@ -2693,20 +1660,29 @@ pub async fn event(
         if [
             "workflow",
             "mode",
+            "permissions",
             "sdd-phase",
             "agents-enabled",
             "agent-count",
             "workspace",
             "clash-enabled",
             "clash-rounds",
+            "clash-thinking-effort",
             "thinking-effort",
             "model-routing-enabled",
-            "brain-link-kind",
-            "brain-link-review",
+            "routing-plan-thinking-effort",
+            "routing-edit-thinking-effort",
             "fleet-dry-run",
+            "omnigraph-enabled",
+            "omnigraph-branch-mode",
+            "omnigraph-existing-branch",
+            "omnigraph-shared-space",
+            "omnigraph-auto-publish",
+            "omnigraph-auto-merge",
         ]
         .contains(&id)
         {
+            mark_dirty_for_id(id);
             controls();
             save_preferences();
             return true;
@@ -2716,8 +1692,20 @@ pub async fn event(
         && (id.starts_with("session-budgets-")
             || id == "model"
             || id == "agent-count"
-            || id == "sdd-feature")
+            || id == "sdd-feature"
+            || id == "clash-model"
+            || id == "clash-rounds"
+            || id == "routing-plan-model"
+            || id == "routing-edit-model"
+            || id == "omnigraph-pull-branches"
+            || id == "omnigraph-session-query"
+            || id == "omnigraph-shared-space"
+            || id == "skillcache-compiler-model")
     {
+        if id.starts_with("omnigraph-") || id.starts_with("skillcache-") {
+            schedule_save_preferences();
+        }
+        mark_dirty_for_id(id);
         controls();
         return true;
     }
@@ -2741,11 +1729,84 @@ pub async fn event(
                 delivery("preview_transfer",json!({"commit":dom::value("delivery-source"),"target_branch":dom::value("delivery-target"),"check":if dom::checked("delivery-check-required"){json!({"command":dom::value("delivery-check-command").trim(),"timeout":dom::num("delivery-check-timeout")})}else{V::Null}})).await;
                 return true;
             }
+            "results-memory-form" => {
+                save_results_memory().await;
+                return true;
+            }
             _ => {}
         }
     }
     if kind != "click" {
         return false;
+    }
+    let captured = CAPTURED_GRAPH_CLICK.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_ref() {
+            Some(c) if c.lib_id == id && c.lib_action == action => guard.take(),
+            _ => {
+                *guard = None;
+                None
+            }
+        }
+    });
+    let (effective_id, effective_action, effective_payload) = if let Some(c) = captured {
+        let eid = if !id.is_empty() {
+            id.to_owned()
+        } else {
+            c.attrs.resolved_id.clone()
+        };
+        let eaction = if !action.is_empty() {
+            action.to_owned()
+        } else {
+            c.attrs.resolved_action.clone()
+        };
+        let epayload = merge_click_payload(payload, &c.attrs, c.in_workspace);
+        (eid, eaction, epayload)
+    } else {
+        (id.to_owned(), action.to_owned(), payload.clone())
+    };
+    let id = effective_id.as_str();
+    let action = effective_action.as_str();
+    let payload = &effective_payload;
+    if id == "sidebar-omnigraph-pill" || action == "sidebar-omnigraph-pill" {
+        set_sidebar_open(false, false);
+        open_view("omnigraph", true).await;
+        return true;
+    }
+    if id == "omnigraph-open-studio" || action == "omnigraph-open-studio" {
+        open_view("omnigraph", true).await;
+        return true;
+    }
+    if id == "session-omnigraph-open" || action == "session-omnigraph-open" {
+        let branch = m::read(|s| m::omnigraph_branch(&s.selected));
+        omnigraph::focus_branch(&branch);
+        open_view("omnigraph", true).await;
+        return true;
+    }
+    if id == "sidebar-graph-pill" || action == "sidebar-graph-pill" {
+        set_sidebar_open(false, false);
+        if m::read(|s| matches!(s.view.as_str(), "systems" | "system-changes")) {
+            systems::focus_system_graph_workspace();
+            return true;
+        }
+        if m::read(|s| s.view != "sessions") {
+            open_view("sessions", true).await;
+        } else {
+            crate::graph_map::sync_embedded(false);
+            spawn_local(async {
+                crate::graph::load(true).await;
+            });
+        }
+        set_mobile_pane("graph");
+        dom::attr("session-graph-workspace", "tabindex", "-1");
+        if let Some(el) = dom::get("session-graph-workspace") {
+            el.scroll_into_view();
+        }
+        dom::focus("session-graph-workspace");
+        return true;
+    }
+    if crate::graph_map::handle_session_graph_click(id, action, payload) {
+        return true;
     }
     if action.ends_with("-agent-apply") {
         split_budgets(repeated_suffix_removed(action, "-agent-apply"));
@@ -2761,18 +1822,42 @@ pub async fn event(
         "reconnect" => bootstrap().await,
         "new-session" => {
             new_session(None);
-            open_view("sessions", true).await;
+            open_view_inner("sessions", true, false).await;
         }
-        "refresh-sessions" => refresh().await,
+        "refresh-sessions" => {
+            refresh().await;
+            omnigraph::session_controls();
+        }
+        "share-sessions-context" => {
+            dom::class("sidebar", "open", false);
+            dom::class("scrim", "open", false);
+            dom::attr("menu-toggle", "aria-expanded", "false");
+            omnigraph::open_share_dialog(None).await;
+        }
+        "omnigraph-open-session" => {
+            let target_id = payload["session_id"]
+                .as_str()
+                .or_else(|| payload.as_str())
+                .unwrap_or("")
+                .to_owned();
+            if !target_id.is_empty() {
+                if m::read(|s| s.sid != target_id) {
+                    crate::graph_map::apply_focus(&V::Null);
+                    crate::graph::run_state(false);
+                }
+                select(&target_id).await;
+            }
+        }
         "session-open" => {
-            select(payload.as_str().unwrap_or("")).await;
-            open_view("sessions", true).await;
+            let target_id = payload.as_str().unwrap_or("");
+            if m::read(|s| s.sid != target_id) {
+                crate::graph_map::apply_focus(&V::Null);
+                crate::graph::run_state(false);
+            }
+            select(target_id).await;
         }
         "cancel-session" => session_action("cancel", json!({}), "composer-error").await,
         "inbox-cancel" => inbox::cancel(payload.as_str().unwrap_or("")).await,
-        "add-task-context" => open_task_context().await,
-        "task-context-cancel" => close_task_context(),
-        "task-context-attach" => attach_task_context(),
         "attach-files" => {
             if let Some(e) =
                 dom::get("attachment-input").and_then(|e| e.dyn_into::<web_sys::HtmlElement>().ok())
@@ -2790,30 +1875,64 @@ pub async fn event(
                 render_files();
             }
         }
+        "session-mobile-pane" => {
+            let pane = payload
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    if id == "session-mobile-tab-graph" {
+                        "graph"
+                    } else {
+                        "chat"
+                    }
+                });
+            set_mobile_pane(pane);
+        }
         "session-settings-toggle" => {
             let open = dom::get("session-settings")
                 .map(|e| e.has_attribute("hidden"))
                 .unwrap_or(true);
             dom::hidden("session-settings", !open);
-            dom::attr(id, "aria-expanded", if open { "true" } else { "false" });
+            dom::attr(
+                "session-settings-toggle",
+                "aria-expanded",
+                if open { "true" } else { "false" },
+            );
         }
         "menu-toggle" => {
             let open = dom::get("sidebar")
                 .map(|e| !e.class_list().contains("open"))
                 .unwrap_or(false);
-            dom::class("sidebar", "open", open);
-            dom::class("scrim", "open", open);
-            dom::attr(
-                "menu-toggle",
-                "aria-expanded",
-                if open { "true" } else { "false" },
-            );
+            set_sidebar_open(open, true);
         }
-        "scrim" => {
-            dom::class("sidebar", "open", false);
-            dom::class("scrim", "open", false);
-            dom::attr("menu-toggle", "aria-expanded", "false");
+        "scrim" => set_sidebar_open(false, true),
+        "history-filter-waiting" => {
+            m::write(|s| s.workspace.history_waiting_only = !s.workspace.history_waiting_only);
+            history();
         }
+        "history-filter-clear" => {
+            m::write(|s| {
+                s.workspace.history_query.clear();
+                s.workspace.history_waiting_only = false;
+            });
+            dom::set_value("history-search", "");
+            history();
+        }
+        "right-tab-graph" | "right-tab-diff" | "right-tab-checks" => {
+            set_workspace_right_tab(action.trim_start_matches("right-tab-"));
+        }
+        "results-jump-diff" => {
+            let scope = m::text(payload, "scope");
+            let path = m::text(payload, "path");
+            if scope == "workspace-results" {
+                set_workspace_right_tab("diff");
+            }
+            crate::run::jump_to_diff_file(&scope, &path);
+            sync_hash_from_state(false);
+        }
+        "workspace-open-changes" => open_view("changes", true).await,
+        "workspace-open-checks" => open_view("checks", true).await,
+        "workspace-refresh-diff" | "workspace-refresh-checks" => results().await,
         "refresh-project-git" => load_git().await,
         "sdd-refresh" => {
             let (sid, selection_epoch) = m::read(|s| (s.sid.clone(), s.epoch));
@@ -2989,6 +2108,12 @@ pub async fn event(
             {
                 return true;
             }
+            if dom::get("merge-archive-content").is_some_and(|e| !e.has_attribute("hidden")) {
+                dom::hidden("merge-archive-content", true);
+                dom::attr("merge-archive", "aria-expanded", "false");
+                dom::text("merge-archive", "View saved context");
+                return true;
+            }
             let generation = m::bind_scope("merge-archive-scope", &sid, "");
             match api::scoped(
                 "merge-archive",
@@ -3005,6 +2130,8 @@ pub async fn event(
                 {
                     dom::pretty("merge-archive-content", &value);
                     dom::hidden("merge-archive-content", false);
+                    dom::attr("merge-archive", "aria-expanded", "true");
+                    dom::text("merge-archive", "Hide saved context");
                 }
                 Err(error)
                     if !error.aborted
@@ -3019,11 +2146,73 @@ pub async fn event(
             }
         }
         "app-update" => apply_update().await,
+        "inspect-file-graph" => {
+            if let Some(path) = extract_inspect_file_path(payload) {
+                if m::read(|s| s.view != "sessions") {
+                    open_view("sessions", true).await;
+                }
+                set_mobile_pane("graph");
+                crate::graph_map::focus_file_in_session(&path);
+            }
+        }
+        "preflight-check" => {
+            dom::cancel_timer("preflight-debounce");
+            run_preflight(true).await;
+        }
+        "preflight-open-memory" => {
+            dom::text(
+                "preflight-status",
+                "Memory Bank and Project Brain views are not enabled in this workspace.",
+            );
+        }
+        "results-memory-add-learning" => {
+            let mut learnings = read_memory_learnings_from_dom();
+            if learnings.len() < 3 {
+                learnings.push(json!({
+                    "type": "finding",
+                    "title": "",
+                    "consequence": "",
+                    "sources": []
+                }));
+                render_memory_learnings_dom(&learnings);
+                m::set("results-memory-dirty", json!(true));
+                result_controls();
+            }
+        }
+        "results-memory-remove-learning" => {
+            if let Some(idx) = payload["index"].as_u64().map(|n| n as usize) {
+                let mut learnings = read_memory_learnings_from_dom();
+                if idx < learnings.len() {
+                    learnings.remove(idx);
+                    render_memory_learnings_dom(&learnings);
+                    m::set("results-memory-dirty", json!(true));
+                    result_controls();
+                }
+            }
+        }
+        "results-memory-prefill" => {
+            m::take("results-memory-dirty");
+            dom::set_checked("results-memory-verified", false);
+            dom::error("results-memory-error", "");
+            dom::clear("results-memory-feedback");
+            dom::hidden("results-memory-feedback", true);
+            prefill_results_memory();
+            result_controls();
+        }
         _ if action.starts_with("option-") => {
             let panel = action.trim_start_matches("option-");
             let open = m::data("option-open") != panel;
             m::set("option-open", if open { json!(panel) } else { V::Null });
-            for name in ["project", "helpers", "clash", "workspace", "budgets", "models"] {
+            for name in [
+                "project",
+                "helpers",
+                "clash",
+                "workspace",
+                "omnigraph",
+                "graph",
+                "budgets",
+                "models",
+            ] {
                 dom::hidden(&format!("panel-{name}"), !open || name != panel);
                 dom::attr(
                     &format!("option-{name}"),
@@ -3038,6 +2227,16 @@ pub async fn event(
             if open {
                 dom::attr(&format!("panel-{panel}"), "tabindex", "-1");
                 dom::focus(&format!("panel-{panel}"));
+                if panel == "omnigraph" {
+                    if m::read(|s| s.sessions.is_empty()) {
+                        refresh().await;
+                    }
+                    omnigraph::load_session_branches().await;
+                    omnigraph::session_controls();
+                }
+                if panel == "graph" {
+                    crate::graph::load(true).await;
+                }
             }
             return true;
         }
@@ -3045,490 +2244,4 @@ pub async fn event(
     }
     let _ = checked;
     true
-}
-fn merge_source_eligible(session: &V, project: &str) -> bool {
-    session["project_id"] == project
-        && !m::active(session)
-        && !["awaiting_context", "awaiting_approval"]
-            .contains(&session["status"].as_str().unwrap_or(""))
-        && session["workflow"] != "fleet-review"
-        && ![
-            "fleet",
-            "creator",
-            "clash",
-            "system_run",
-            "system_discovery",
-        ]
-        .iter()
-        .any(|key| session[*key].is_object())
-}
-async fn merge_picker() {
-    let p = dom::value("project");
-    let epoch = m::read(|s| s.epoch);
-    refresh().await;
-    if dom::value("project") != p || m::read(|s| s.epoch) != epoch {
-        return;
-    }
-    m::set("merge-picker-owner", json!({"project":p,"epoch":epoch}));
-    let sessions = m::read(|s| s.sessions.clone());
-    dom::clear("merge-options");
-    for v in sessions
-        .into_iter()
-        .filter(|v| merge_source_eligible(v, &p))
-    {
-        dom::append(
-            "merge-options",
-            &dom::check(&m::summary(&v), "merge-choice", &m::text(&v, "id"), false),
-        );
-    }
-    dom::disabled("merge-picker-continue", true);
-    dom::text("merge-selection-count", "No chats selected");
-    dom::dialog("merge-picker", true);
-}
-
-fn context_meter(session: &V) {
-    let last = &session["context_last"];
-    let window = last["window"].as_f64().filter(|n| n.is_finite() && *n > 0.);
-    let fill = last["fill"].as_f64().filter(|n| n.is_finite() && *n >= 0.);
-    let Some((window, fill)) = window.zip(fill) else {
-        dom::hidden("context-meter", true);
-        return;
-    };
-    let ratio = fill / window;
-    let compacted = last["compacted"] == true;
-    let show = ratio >= 0.5 || compacted;
-    dom::hidden("context-meter", !show);
-    if !show {
-        return;
-    }
-    for (key, value) in [
-        ("max", window),
-        ("value", fill.min(window)),
-        ("low", window * 0.5),
-        ("high", window * 0.8),
-        ("optimum", 0.),
-    ] {
-        dom::attr("context-meter-bar", key, &value.to_string());
-    }
-    dom::attr(
-        "context-meter-bar",
-        "aria-valuetext",
-        &format!("{fill:.0} of {window:.0} tokens"),
-    );
-    let full = ratio >= 0.8;
-    let percent = format!("{:.0}%", 100. * ratio);
-    dom::text(
-        "context-meter-text",
-        &format!(
-            "{}{percent}{}",
-            if full { "▲ " } else { "" },
-            if compacted {
-                " · compacted"
-            } else if full {
-                " · nearly full"
-            } else {
-                ""
-            }
-        ),
-    );
-    dom::attr(
-        "context-meter",
-        "data-full",
-        if full { "true" } else { "false" },
-    );
-    dom::attr(
-        "context-meter",
-        "aria-label",
-        &format!(
-            "Context {percent} full{}. Open usage.",
-            if compacted { ", compacted" } else { "" }
-        ),
-    );
-}
-
-pub fn group_view(group: &str) -> String {
-    if group == "sessions" {
-        return "sessions".into();
-    }
-    m::data(&format!("last-view-{group}"))
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| "systems".into())
-}
-fn view_label(view: &str) -> &str {
-    match view {
-        "sessions" => "Conversation",
-        "systems" => "Services",
-        "system-changes" | "changes" => "Changes",
-        "checks" => "Checks",
-        "usage" => "Usage",
-        "memory-use" => "Memory use",
-        "brain" => "Project Brain",
-        "memory" => "Memory bank",
-        "context" => "Context files",
-        "skills" => "Library",
-        "create-skill" => "Create skill",
-        "accelerators" => "Overview",
-        "creator" => "Infrastructure Creator",
-        "kit3" => "Open Source Kit",
-        "setup" => "Install into project",
-        _ => view,
-    }
-}
-fn render_tabs(view: &str, group: &str) {
-    let views: &[&str] = match group {
-        "sessions" => &["sessions", "changes", "checks", "usage"],
-        _ => &["systems", "system-changes"],
-    };
-    let sid = m::read(|s| s.sid.clone());
-    let views = views
-        .iter()
-        .copied()
-        .filter(|v| !["changes", "checks", "usage"].contains(v) || !sid.is_empty())
-        .collect::<Vec<_>>();
-    dom::clear("view-tabs");
-    dom::hidden("view-tabs", views.len() < 2);
-    for item in views {
-        let button = dom::button(view_label(item), "view-open", json!(item));
-        button.set_class_name("view-tab");
-        let _ = button.set_attribute("data-view", item);
-        if item == view {
-            let _ = button.set_attribute("aria-current", "page");
-        }
-        dom::append("view-tabs", &button);
-    }
-}
-
-fn repeated_suffix_removed<'a>(mut value: &'a str, suffix: &str) -> &'a str {
-    if suffix.is_empty() {
-        return value;
-    }
-    while let Some(rest) = value.strip_suffix(suffix) {
-        value = rest;
-    }
-    value
-}
-
-fn merge_controls() {
-    let mut draft = m::data("merge-draft");
-    let (sid, epoch) = m::read(|s| (s.sid.clone(), s.epoch));
-    if draft.is_object() && !merge_draft_owned(&draft, &sid, &dom::value("project"), epoch) {
-        m::take("merge-draft");
-        draft = V::Null;
-        reset_merge_archive();
-    }
-    let session = m::read(|s| s.selected.clone());
-    let merging = draft.is_object();
-    if merging {
-        dom::hidden("merge-context", false);
-        dom::text("merge-context-title", "Merge chats into a new task");
-        dom::text("merge-context-note","The first launch reads an immutable archive of these chats as untrusted history. Write the new task's instruction below.");
-        dom::clear("merge-context-sources");
-        for id in m::array(&draft["sources"]) {
-            let source = m::read(|s| {
-                s.sessions
-                    .iter()
-                    .find(|v| v["id"] == id)
-                    .cloned()
-                    .unwrap_or(V::Null)
-            });
-            dom::append(
-                "merge-context-sources",
-                &dom::el("p", "merge-source", &m::summary(&source)),
-            );
-        }
-        dom::hidden("merge-clear", false);
-        for id in ["workflow", "workspace", "clash-enabled", "attach-files"] {
-            dom::disabled(id, true);
-        }
-    } else if session["merge"].is_object() {
-        dom::hidden("merge-context", false);
-        dom::hidden("merge-clear", true);
-        dom::hidden(
-            "merge-archive",
-            session["merge"]["archive_deleted_at"].is_string(),
-        );
-        dom::hidden(
-            "merge-delete",
-            session["merge"]["archive_deleted_at"].is_string(),
-        );
-        dom::disabled("merge-delete", m::active(&session));
-        dom::hidden(
-            "merge-restart",
-            !["interrupted", "failed"].contains(&session["status"].as_str().unwrap_or(""))
-                || session["native_session_id"].is_string()
-                || session["merge"]["archive_deleted_at"].is_string(),
-        );
-    } else {
-        dom::hidden("merge-context", true);
-    }
-}
-
-pub fn budget_fields_valid(prefix: &str) -> bool {
-    ["usd", "tokens", "seconds"]
-        .iter()
-        .all(|key| dom::numeric_valid(&format!("{prefix}-{key}")))
-}
-
-#[cfg(test)]
-mod history_projection_tests {
-    use super::*;
-
-    #[test]
-    fn sidebar_projection_preserves_labels_order_and_selection() {
-        let sessions = vec![
-            json!({"id":"a","name":"Named chat","title":"Unused title","status":"running"}),
-            json!({"id":"b","title":"Second chat","status":"awaiting_approval"}),
-        ];
-        assert_eq!(
-            history_projection(&sessions, "b"),
-            json!([
-                {"id":"a","label":"Named chat · running","selected":false},
-                {"id":"b","label":"Second chat · awaiting approval","selected":true}
-            ])
-        );
-        let original = history_projection(&sessions, "b");
-        assert_ne!(original, history_projection(&sessions, "a"));
-        let mut reversed = sessions.clone();
-        reversed.reverse();
-        assert_ne!(original, history_projection(&reversed, "b"));
-        assert_eq!(history_projection(&[], "b"), json!([]));
-    }
-
-    #[test]
-    fn sidebar_changes_only_when_rendered_fields_change() {
-        let session = json!({"id":"a","title":"Chat","status":"running"});
-        let original = history_projection(std::slice::from_ref(&session), "a");
-        let mut report_changed = session.clone();
-        report_changed["budget_usage"] = json!({"tokens":900});
-        report_changed["fleet_result"] = json!({"report":"new report"});
-        assert_eq!(original, history_projection(&[report_changed], "a"));
-        for (field, value) in [
-            ("id", "b"),
-            ("title", "Renamed chat"),
-            ("name", "Preferred name"),
-            ("status", "completed"),
-        ] {
-            let mut changed = session.clone();
-            changed[field] = json!(value);
-            assert_ne!(original, history_projection(&[changed], "a"), "{field}");
-        }
-        assert_eq!(
-            history_projection(&[json!({"id":"fallback"})], ""),
-            json!([{"id":"fallback","label":"fallback · ","selected":false}])
-        );
-    }
-}
-
-#[cfg(test)]
-mod session_contract_tests {
-    use super::*;
-    #[test]
-    fn merge_settings_never_replace_the_saved_ordinary_project_draft() {
-        let previous = json!({"drafts":{"a":{"workflow":"sdd","prompt":"ordinary work"}},"project_id":"a","session_id":null});
-        let merge = json!({"project_id":"a","selection_epoch":4,"sources":["x","y"]});
-        assert!(preferences_update(
-            previous.clone(),
-            "a",
-            "",
-            json!({"workflow":"native","prompt":m::MERGE_PROMPT}),
-            &merge
-        )
-        .is_none());
-        let next =
-            preferences_update(previous, "a", "existing", json!({"prompt":""}), &V::Null).unwrap();
-        assert_eq!(next["drafts"]["a"]["workflow"], "sdd");
-        assert_eq!(next["drafts"]["a"]["prompt"], "ordinary work");
-        assert_eq!(next["session_id"], "existing");
-    }
-    #[test]
-    fn a_merge_draft_ends_on_session_project_or_selection_generation_change() {
-        let draft = json!({"project_id":"a","selection_epoch":4,"sources":["x","y"]});
-        assert!(merge_draft_owned(&draft, "", "a", 4));
-        assert!(!merge_draft_owned(&draft, "chat", "a", 4));
-        assert!(!merge_draft_owned(&draft, "", "b", 4));
-        assert!(!merge_draft_owned(&draft, "", "a", 6));
-    }
-    #[test]
-    fn budget_payload_contains_worker_timeout_only_for_fleet() {
-        let ordinary = budget_request(
-            &json!({"workflow":"native","budget_revision":2}),
-            json!({"tokens":100}),
-            json!(300),
-        );
-        assert!(ordinary.get("worker_timeout").is_none());
-        let fleet = budget_request(
-            &json!({"workflow":"fleet-review","fleet":{},"budget_revision":3}),
-            json!({"usd":5}),
-            json!(17),
-        );
-        assert_eq!(fleet["worker_timeout"], 17);
-        assert_eq!(fleet["revision"], 3);
-        assert_eq!(fleet["budgets"]["usd"], 5);
-    }
-}
-
-#[cfg(test)]
-mod draft_project_tests {
-    use super::*;
-    #[test]
-    fn a_direct_project_selection_saves_the_previous_form_under_its_bound_project() {
-        m::set("composer-project", json!("a"));
-        let owner = draft_project("b");
-        let previous = json!({"project_id":"a","session_id":"old-chat","drafts":{
-            "a":{"prompt":"old a","bank":"bank-a","task":"task-a"},
-            "b":{"prompt":"keep b","bank":"bank-b","task":"task-b","extra":{"retain":true}}
-        }});
-        let draft_b = previous["drafts"]["b"].clone();
-        // The project select already says B while these extracted controls still belong to A.
-        let extracted_a = json!({"prompt":"edited a","bank":"bank-a","task":"task-a"});
-        let saved =
-            preferences_update(previous, &owner, "", extracted_a.clone(), &V::Null).unwrap();
-        assert_eq!(saved["drafts"]["a"], extracted_a);
-        assert_eq!(saved["drafts"]["b"], draft_b);
-        m::set("composer-project", json!("b"));
-        let owner = draft_project("b");
-        assert_eq!(owner, "b");
-        // Selection persistence must not extract the still-unrestored A bank/task controls again.
-        let persisted = preferences_selection(saved, &owner, "");
-        assert_eq!(persisted["project_id"], "b");
-        assert!(persisted["session_id"].is_null());
-        assert_eq!(persisted["drafts"]["a"], extracted_a);
-        assert_eq!(persisted["drafts"]["b"], draft_b);
-        m::take("composer-project");
-    }
-}
-
-#[cfg(test)]
-mod update_tests {
-    use super::*;
-    fn status(state: &str, detail: &str) -> V {
-        json!({"state":state,"detail":detail,"behind":0,"ahead":0,"commits":[],"upstream":"origin/main","version":"6e5a8cc"})
-    }
-    #[test]
-    fn an_available_update_shows_the_button_and_its_commits_on_hover() {
-        let mut available = status("available", "12 new changes on origin/main.");
-        available["behind"] = json!(12);
-        available["commits"] = (1..=12)
-            .map(|n| json!({"hash":format!("abc{n}"),"subject":format!("change {n}")}))
-            .collect();
-        let view = update_view(&available, &V::Null);
-        assert!(view.button && !view.busy);
-        assert_eq!(view.label, "Update");
-        let lines = view.title.lines().collect::<Vec<_>>();
-        assert_eq!(lines.len(), 12);
-        assert_eq!(lines[0], "12 new changes on origin/main.");
-        assert_eq!(lines[1], "• change 1");
-        assert_eq!(lines[10], "• change 10");
-        assert_eq!(lines[11], "… and 2 more");
-        assert!(view.note.is_empty());
-        let mut one = status("available", "1 new changes on origin/main.");
-        one["behind"] = json!(1);
-        one["commits"] = json!([{"hash":"abc1","subject":"docs: one"}]);
-        assert_eq!(
-            update_view(&one, &V::Null).title,
-            "1 new changes on origin/main.\n• docs: one"
-        );
-    }
-    #[test]
-    fn nothing_is_offered_without_an_update_whatever_else_the_status_says() {
-        for state in [
-            "unknown",
-            "current",
-            "unavailable",
-            "updating",
-            "updated",
-            "",
-        ] {
-            let mut value = status(state, "This clone is not on a branch.");
-            // The server never sends this key; the button follows the state alone.
-            value["available"] = json!(true);
-            let view = update_view(&value, &V::Null);
-            assert!(!view.button, "{state}");
-            assert!(view.note.is_empty() && view.title.is_empty(), "{state}");
-        }
-        assert!(!update_view(&V::Null, &V::Null).button);
-    }
-    #[test]
-    fn a_diverged_failed_or_held_update_says_why_in_the_banner() {
-        let diverged = update_view(
-            &status(
-                "diverged",
-                "2 new changes on origin/main; this clone has 1 commits of its own. Update it with Git.",
-            ),
-            &V::Null,
-        );
-        assert!(!diverged.button && !diverged.error);
-        assert!(diverged.note.ends_with("Update it with Git."));
-        let failed = update_view(
-            &status(
-                "failed",
-                "The update could not be applied: Git exited with status 128.",
-            ),
-            &V::Null,
-        );
-        assert!(!failed.button && failed.error);
-        assert_eq!(
-            failed.note,
-            "The update could not be applied: Git exited with status 128."
-        );
-        let held = update_view(
-            &status("restart-required", "The workspace is now at 43a21a0, but its browser interface was built from other sources. Run `./bin/orch-engine` UI build, then press Update again."),
-            &V::Null,
-        );
-        assert!(held.button && !held.busy && held.error);
-        assert_eq!(held.label, "Update");
-        assert!(held.note.contains("press Update again"));
-    }
-    #[test]
-    fn what_this_page_did_takes_over_the_button_and_the_banner() {
-        let available = status("available", "1 new changes on origin/main.");
-        let pending = update_view(&available, &json!({"pending":true}));
-        assert!(pending.button && pending.busy);
-        assert_eq!(pending.label, "Updating…");
-        let restarting = update_view(
-            &status("updated", ""),
-            &json!({"restarting":true,"note":"Updated to 43a21a0. The Harness is restarting; this page reloads by itself."}),
-        );
-        assert!(restarting.button && restarting.busy && !restarting.error);
-        assert_eq!(restarting.label, "Restarting…");
-        assert!(restarting.note.starts_with("Updated to 43a21a0."));
-        // A refused update keeps its message, also over the detail the server recorded.
-        let refused = update_view(
-            &status("restart-required", "recorded detail"),
-            &json!({"failed":true,"note":"An update is waiting for the Harness to restart."}),
-        );
-        assert!(refused.button && !refused.busy && refused.error);
-        assert_eq!(
-            refused.note,
-            "An update is waiting for the Harness to restart."
-        );
-        let current = update_view(
-            &status("current", ""),
-            &json!({"note":"This clone is already up to date."}),
-        );
-        assert!(!current.button && !current.error);
-        assert_eq!(current.note, "This clone is already up to date.");
-    }
-    #[test]
-    fn commands_quoted_in_a_note_become_code() {
-        assert_eq!(
-            code_spans(
-                "In the clone, run `cargo build --release`, then `./bin/orch-engine serve`."
-            ),
-            vec![
-                (false, "In the clone, run "),
-                (true, "cargo build --release"),
-                (false, ", then "),
-                (true, "./bin/orch-engine serve"),
-                (false, "."),
-            ]
-        );
-        assert_eq!(code_spans("`a`"), vec![(true, "a")]);
-        assert_eq!(
-            code_spans("an unpaired ` stays"),
-            vec![(false, "an unpaired ` stays")]
-        );
-        assert!(code_spans("").is_empty());
-    }
 }

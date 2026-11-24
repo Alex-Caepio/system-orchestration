@@ -2,6 +2,8 @@
 use crate::{Result, domain};
 use serde_json::{Value, json};
 
+pub const CAPSULE_CHARACTER_LIMIT: usize = 8000;
+
 const SECTIONS: &[&str] = &[
     "objective",
     "output format",
@@ -16,8 +18,10 @@ pub fn validate_capsule_text(content: &str) -> Result<Vec<String>> {
     }
     let mut problems = Vec::new();
     let length = content.chars().count();
-    if length > 8000 {
-        problems.push(format!("capsule exceeds 8000 characters ({length})"));
+    if length > CAPSULE_CHARACTER_LIMIT {
+        problems.push(format!(
+            "capsule exceeds {CAPSULE_CHARACTER_LIMIT} characters ({length})"
+        ));
     }
     let lowered = content.to_lowercase();
     for section in SECTIONS {

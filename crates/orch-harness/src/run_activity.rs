@@ -1,9 +1,11 @@
 //! Display enrichment and activity counts never retain tool output or file contents.
+use crate::graph_live::{CreatedEntity, GraphFocus, LiveFocusTracker};
 use fancy_regex::Regex;
 use serde_json::{Value, json as object};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
-    sync::OnceLock,
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
 };
 const ENRICH_BYTES: usize = 1024 * 1024;
 const ENRICH_EVENTS: usize = 4000;
@@ -255,6 +257,133 @@ pub fn relative(path: &str, root: &str, alias: Option<&str>) -> (Option<String>,
         true,
     )
 }
+const MAX_STRIP_ROOT_REGEX_CACHE: usize = 128;
+
+type StripRootRegexKey = (String, String, bool);
+type CompiledStripRoot = Option<Arc<Vec<(Regex, String)>>>;
+
+#[derive(Default)]
+struct StripRootRegexCache {
+    entries: BTreeMap<StripRootRegexKey, CompiledStripRoot>,
+    order: VecDeque<StripRootRegexKey>,
+}
+
+#[cfg(test)]
+fn strip_root_regex_compile_counts() -> &'static Mutex<BTreeMap<String, usize>> {
+    static COUNTS: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+    COUNTS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn strip_root_regex_cache() -> &'static Mutex<StripRootRegexCache> {
+    static CACHE: OnceLock<Mutex<StripRootRegexCache>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(StripRootRegexCache::default()))
+}
+
+fn compile_strip_root_patterns(variant: &str, name: &str, win: bool) -> CompiledStripRoot {
+    let escaped = if win {
+        variant
+            .split('/')
+            .map(regex::escape)
+            .collect::<Vec<_>>()
+            .join(r"[\\/]+")
+    } else {
+        regex::escape(variant)
+    };
+    let mut compiled = Vec::with_capacity(6);
+    for (start, inner) in [
+        (
+            r"(?:(?<=\s-[A-Za-z])|(?<=^-[A-Za-z])|(?<=file://))",
+            format!("{name}/"),
+        ),
+        (
+            r"(?<![\w./\\-])",
+            if name == "." {
+                String::new()
+            } else {
+                format!("{name}/")
+            },
+        ),
+    ] {
+        let start = format!("{}{start}{escaped}", if win { "(?i)" } else { "" });
+        for (pattern, replacement) in [
+            (format!(r#"{start}[\\/]+(?=[^\s"'`;|&<>()])"#), inner),
+            (format!(r"{start}[\\/]+"), format!("{name}/")),
+            (format!(r"{start}(?![\w./\\-])"), name.into()),
+        ] {
+            #[cfg(test)]
+            if let Ok(mut counts) = strip_root_regex_compile_counts().lock() {
+                *counts.entry(variant.to_owned()).or_insert(0) += 1;
+            }
+            let regex = Regex::new(&pattern).ok()?;
+            compiled.push((regex, replacement));
+        }
+    }
+    Some(Arc::new(compiled))
+}
+
+fn cached_strip_root_patterns(variant: &str, name: &str, win: bool) -> CompiledStripRoot {
+    let key = (variant.to_owned(), name.to_owned(), win);
+    if let Ok(mut guard) = strip_root_regex_cache().lock()
+        && let Some(found) = guard.entries.get(&key).cloned()
+    {
+        if let Some(pos) = guard.order.iter().position(|k| k == &key) {
+            guard.order.remove(pos);
+        }
+        guard.order.push_back(key);
+        return found;
+    }
+    let built = compile_strip_root_patterns(variant, name, win);
+    if let Ok(mut guard) = strip_root_regex_cache().lock() {
+        if let Some(pos) = guard.order.iter().position(|k| k == &key) {
+            guard.order.remove(pos);
+        } else if guard.entries.len() >= MAX_STRIP_ROOT_REGEX_CACHE
+            && let Some(evict) = guard.order.pop_front()
+        {
+            guard.entries.remove(&evict);
+        }
+        guard.order.push_back(key.clone());
+        guard.entries.insert(key, built.clone());
+    }
+    built
+}
+
+/// Normalizes a shell command into a canonical signature so trivial output paging/redirection
+/// tweaks (`2>&1`, `| head -n 20`, extra whitespace) map to the same telemetry signature.
+pub fn normalize_command_signature(command: &str) -> String {
+    let mut trimmed = command.trim();
+    loop {
+        let next = trimmed.trim_end();
+        let stripped = if let Some(idx) = next.rfind('|') {
+            let tail = next[idx + 1..].trim_start();
+            let head_word = tail.split_whitespace().next().unwrap_or("");
+            if [
+                "head", "tail", "cat", "less", "more", "wc", "grep", "rg", "tee",
+            ]
+            .contains(&head_word)
+            {
+                &next[..idx]
+            } else {
+                next
+            }
+        } else {
+            next
+        };
+        let without_redir = stripped
+            .trim_end()
+            .strip_suffix("2>&1")
+            .or_else(|| stripped.trim_end().strip_suffix("1>/dev/null"))
+            .or_else(|| stripped.trim_end().strip_suffix("2>/dev/null"))
+            .or_else(|| stripped.trim_end().strip_suffix(">/dev/null"))
+            .map(str::trim_end);
+        match without_redir {
+            Some(shorter) if shorter.len() < next.len() => trimmed = shorter,
+            _ if stripped.len() < next.len() => trimmed = stripped,
+            _ => break,
+        }
+    }
+    trimmed.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 pub fn strip_root(value: &str, roots: &[String], home: Option<&str>) -> String {
     let mut result = value.to_string();
     for (root, name) in roots
@@ -270,53 +399,42 @@ pub fn strip_root(value: &str, roots: &[String], home: Option<&str>) -> String {
         if root.chars().count() < 3 {
             continue;
         }
-        let mut variants = BTreeSet::new();
-        variants.insert(root.clone());
-        if win {
-            variants.insert(root.replace('\\', "/"));
-            variants.insert(root.replace('/', "\\"));
-        }
-        for variant in variants {
-            if !(if win {
-                result.to_lowercase().contains(&variant.to_lowercase())
-            } else {
-                result.contains(&variant)
-            }) {
-                continue;
-            }
-            let escaped = regex::escape(&variant);
-            for (start, inner) in [
-                (
-                    r"(?:(?<=\s-[A-Za-z])|(?<=^-[A-Za-z])|(?<=file://))",
-                    format!("{name}/"),
-                ),
-                (
-                    r"(?<![\w./\\-])",
-                    if name == "." {
-                        String::new()
+        let contains = if win {
+            fn collapse_seps_lower(text: &str) -> String {
+                let mut out = String::with_capacity(text.len());
+                let mut prev_sep = false;
+                for ch in text.chars() {
+                    let mapped = if ch == '\\' { '/' } else { ch };
+                    if mapped == '/' {
+                        if !prev_sep {
+                            out.push('/');
+                            prev_sep = true;
+                        }
                     } else {
-                        format!("{name}/")
-                    },
-                ),
-            ] {
-                let start = format!("{}{start}{escaped}", if win { "(?i)" } else { "" });
-                for (pattern, replacement) in [
-                    (
-                        format!(r#"{start}[\\/]+(?=[^\s"'`;|&<>()])"#),
-                        inner.clone(),
-                    ),
-                    (format!(r"{start}[\\/]+"), format!("{name}/")),
-                    (format!(r"{start}(?![\w./\\-])"), name.into()),
-                ] {
-                    let Ok(pattern) = Regex::new(&pattern) else {
-                        return "[redacted]".into();
-                    };
-                    let Some(clean) = replace(&pattern, &result, 0, Some(&replacement)) else {
-                        return "[redacted]".into();
-                    };
-                    result = clean;
+                        prev_sep = false;
+                        for lc in mapped.to_lowercase() {
+                            out.push(lc);
+                        }
+                    }
                 }
+                out
             }
+            let needle = collapse_seps_lower(&root);
+            collapse_seps_lower(&result).contains(&needle)
+        } else {
+            result.contains(&root)
+        };
+        if !contains {
+            continue;
+        }
+        let Some(patterns) = cached_strip_root_patterns(&root, name, win) else {
+            return "[redacted]".into();
+        };
+        for (pattern, replacement) in patterns.iter() {
+            let Some(clean) = replace(pattern, &result, 0, Some(replacement)) else {
+                return "[redacted]".into();
+            };
+            result = clean;
         }
     }
     result
@@ -400,11 +518,15 @@ pub struct RunLedger {
     uncalled: BTreeMap<String, VecDeque<Entry>>,
     last_commands: VecDeque<(u64, Value)>,
     command_id: u64,
+    command_signature_counts: BTreeMap<String, u64>,
+    command_signature_failures: BTreeMap<String, u64>,
     watch: Option<BTreeMap<String, String>>,
     watch_outside: bool,
     watched: BTreeSet<String>,
     reads: u64,
     outside_reads: u64,
+    focus_tracker: LiveFocusTracker,
+    focus_events: VecDeque<Value>,
 }
 impl RunLedger {
     pub fn new(provider: &str, watch: Option<BTreeMap<String, String>>, outside: bool) -> Self {
@@ -429,12 +551,40 @@ impl RunLedger {
             uncalled: BTreeMap::new(),
             last_commands: VecDeque::new(),
             command_id: 0,
+            command_signature_counts: BTreeMap::new(),
+            command_signature_failures: BTreeMap::new(),
             watch,
             watch_outside: outside,
             watched: BTreeSet::new(),
             reads: 0,
             outside_reads: 0,
+            focus_tracker: LiveFocusTracker::new(PathBuf::new()),
+            focus_events: VecDeque::new(),
         }
+    }
+    pub fn set_focus_root(&mut self, root: PathBuf) {
+        self.focus_tracker.set_root(root);
+    }
+    pub fn seed_graph_focus(&mut self, focus: GraphFocus) {
+        self.focus_tracker.seed_focus(focus);
+    }
+    pub fn graph_focus(&self) -> &GraphFocus {
+        self.focus_tracker.focus()
+    }
+    pub fn created_entities(&self) -> &[CreatedEntity] {
+        &self.focus_tracker.focus().created_entities
+    }
+    pub fn target_paths(&self) -> &[String] {
+        &self.focus_tracker.focus().target_paths
+    }
+    pub fn target_folders(&self) -> &[String] {
+        &self.focus_tracker.focus().target_folders
+    }
+    pub fn take_focus_event(&mut self) -> Option<Value> {
+        self.focus_events.pop_front()
+    }
+    pub fn take_focus_events(&mut self) -> Vec<Value> {
+        self.focus_events.drain(..).collect()
     }
     fn changes(fields: &Value, private: &Private) -> Vec<(String, Option<String>, String)> {
         let changes = fields["changes"]
@@ -492,6 +642,9 @@ impl RunLedger {
             }
             self.reads += 1;
             self.outside_reads += u64::from(outside);
+            if let Some(rel) = path.as_deref() {
+                self.focus_tracker.record_read(rel);
+            }
             entry.read = path;
         } else if kind == "skill"
             && fields["detail"]
@@ -500,9 +653,12 @@ impl RunLedger {
         {
             self.reads += 1;
             entry.read = Some(format!("skill:{}", fields["detail"].as_str().unwrap_or("")));
-        } else if (edit(&kind) || delete(&kind))
+        } else if (edit(&kind) || kind == "file_change" || delete(&kind))
             && fields["path"].as_str().is_some_and(|path| !path.is_empty())
         {
+            if let Some(rel) = path.as_deref() {
+                self.focus_tracker.record_mutation_start(rel);
+            }
             let created = kind == "write"
                 && private.existed.map(|value| !value).unwrap_or_else(|| {
                     !self.opened.iter().any(|(old, _)| old == &key)
@@ -530,9 +686,38 @@ impl RunLedger {
             }
         } else if command(&kind) {
             self.commands += 1;
+            let raw_command = fields["detail"].as_str().unwrap_or("");
+            if crate::graph::asked(raw_command) {
+                self.graph += 1;
+            }
             self.command_id += 1;
             entry.command = Some(self.command_id);
-            self.last_commands.push_back((self.command_id,object!({"command":fields["detail"].as_str().unwrap_or(""),"ok":null,"outcome":null,"exit_code":null})));
+            let signature = normalize_command_signature(raw_command);
+            let repeats = if signature.is_empty() {
+                0
+            } else if self.command_signature_counts.len() < 512
+                || self.command_signature_counts.contains_key(&signature)
+            {
+                let count = self
+                    .command_signature_counts
+                    .entry(signature.clone())
+                    .or_insert(0);
+                *count = count.saturating_add(1);
+                *count
+            } else {
+                1
+            };
+            self.last_commands.push_back((
+                self.command_id,
+                object!({
+                    "command": raw_command,
+                    "signature": signature,
+                    "repeats": repeats,
+                    "ok": null,
+                    "outcome": null,
+                    "exit_code": null
+                }),
+            ));
             while self.last_commands.len() > 12 {
                 self.last_commands.pop_front();
             }
@@ -545,16 +730,35 @@ impl RunLedger {
         {
             self.helpers += 1;
         }
+        for (_, maybe_rel, _) in &entry.changes {
+            if let Some(rel) = maybe_rel.as_deref() {
+                self.focus_tracker.record_mutation_start(rel);
+            }
+        }
         entry
     }
     fn finish(&mut self, entry: Entry, fields: &Value, private: &Private) {
         let ok = fields["ok"] != false;
         let not_run = fields["outcome"] == "not_run";
         if let Some(id) = entry.command {
+            let mut failed_sig = None;
             if let Some((_, command)) = self.last_commands.iter_mut().find(|(key, _)| *key == id) {
                 command["ok"] = ok.into();
                 command["outcome"] = fields["outcome"].clone();
                 command["exit_code"] = fields["exit_code"].clone();
+                if !ok && !not_run {
+                    failed_sig = command["signature"]
+                        .as_str()
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_owned);
+                }
+            }
+            if let Some(sig) = failed_sig
+                && (self.command_signature_failures.len() < 512
+                    || self.command_signature_failures.contains_key(&sig))
+            {
+                let count = self.command_signature_failures.entry(sig).or_insert(0);
+                *count = count.saturating_add(1);
             }
             if !ok {
                 self.not_run += u64::from(not_run);
@@ -579,6 +783,10 @@ impl RunLedger {
             entry.changes
         };
         for (key, path, kind) in entry.keys.into_iter().chain(changes) {
+            if let Some(rel) = path.as_deref() {
+                self.focus_tracker
+                    .record_mutation_complete(rel, Some(kind.as_str()));
+            }
             if !self.edited.iter().any(|(old, _)| old == &key) {
                 self.edited.push((key.clone(), path));
             }
@@ -587,6 +795,9 @@ impl RunLedger {
             } else if kind == "delete" {
                 self.deleted.insert(key);
             }
+        }
+        if let Some(delta) = self.focus_tracker.take_delta_event() {
+            self.focus_events.push_back(delta);
         }
     }
     fn observe_private(&mut self, label: &Value, fields: Option<&Value>, private: &Private) {
@@ -626,6 +837,9 @@ impl RunLedger {
                 self.steps += 1;
                 let entry = self.start(fields, private);
                 if state == "started" {
+                    if let Some(delta) = self.focus_tracker.take_delta_event() {
+                        self.focus_events.push_back(delta);
+                    }
                     if let Some(call) = call {
                         self.calls.insert(call.into(), entry);
                     } else if !kind.is_empty() {
@@ -675,9 +889,39 @@ impl RunLedger {
                 .take(40)
                 .collect::<Vec<_>>()
         };
-        let mut receipt = object!({"steps":self.steps,"opened":self.opened.len(),"opened_paths":listed(&self.opened),"edited":self.edited.len(),"edited_paths":listed(&self.edited),"created":self.created.len(),"deleted":self.deleted.len(),"searched":self.searched,"patterns":self.patterns.iter().take(12).collect::<Vec<_>>(),"commands":self.commands,"graph":self.graph,"failed":self.failed,"not_run":self.not_run,"failed_steps":self.failed_steps,"last_commands":self.last_commands.iter().map(|(_,value)|value.clone()).collect::<Vec<_>>(),"plan":self.plan,"helpers":self.helpers,"limited":self.limited});
+        let mut command_loops: Vec<(u64, u64, &str)> = self
+            .command_signature_counts
+            .iter()
+            .filter(|(_, count)| **count >= 2)
+            .map(|(sig, count)| {
+                let failed = self
+                    .command_signature_failures
+                    .get(sig)
+                    .copied()
+                    .unwrap_or(0);
+                (*count, failed, sig.as_str())
+            })
+            .collect();
+        command_loops.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(b.2)));
+        let loop_rows: Vec<Value> = command_loops
+            .into_iter()
+            .take(12)
+            .map(|(count, failed, sig)| {
+                object!({"signature": sig, "count": count, "failed": failed})
+            })
+            .collect();
+        let max_command_repeats = self
+            .command_signature_counts
+            .values()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let mut receipt = object!({"steps":self.steps,"opened":self.opened.len(),"opened_paths":listed(&self.opened),"edited":self.edited.len(),"edited_paths":listed(&self.edited),"created":self.created.len(),"deleted":self.deleted.len(),"searched":self.searched,"patterns":self.patterns.iter().take(12).collect::<Vec<_>>(),"commands":self.commands,"graph":self.graph,"failed":self.failed,"not_run":self.not_run,"failed_steps":self.failed_steps,"last_commands":self.last_commands.iter().map(|(_,value)|value.clone()).collect::<Vec<_>>(),"max_command_repeats":max_command_repeats,"command_loops":loop_rows,"plan":self.plan,"helpers":self.helpers,"limited":self.limited});
         if let Some(memory) = self.memory() {
             receipt["memory"] = memory;
+        }
+        if !self.focus_tracker.focus().created_entities.is_empty() {
+            receipt["created_entities"] = object!(self.focus_tracker.focus().created_entities);
         }
         receipt
     }
@@ -758,6 +1002,10 @@ impl Enricher {
         watch: Option<BTreeMap<String, String>>,
         outside: bool,
     ) -> Self {
+        let mut ledger = RunLedger::new(provider, watch, outside);
+        if !root.is_empty() {
+            ledger.set_focus_root(PathBuf::from(root));
+        }
         Self {
             _provider: provider.into(),
             root: root.into(),
@@ -780,8 +1028,14 @@ impl Enricher {
             last_plan: None,
             plan_items: None,
             plan_total: 0,
-            ledger: RunLedger::new(provider, watch, outside),
+            ledger,
         }
+    }
+    pub fn take_focus_event(&mut self) -> Option<Value> {
+        self.ledger.take_focus_event()
+    }
+    pub fn take_focus_events(&mut self) -> Vec<Value> {
+        self.ledger.take_focus_events()
     }
     pub fn text(&self, value: &str, limit: usize) -> Option<String> {
         clean(
@@ -1039,4 +1293,233 @@ pub fn user_home() -> Option<String> {
     std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" })
         .ok()
         .filter(|value| !value.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::TempDir;
+
+    #[test]
+    fn enricher_tracks_pre_edit_baseline_and_emits_live_focus_deltas() {
+        let dir = TempDir::new().expect("temp dir");
+        let root = dir.path();
+        fs::create_dir_all(root.join("src/Auth")).expect("auth dir");
+        let target_file = root.join("src/Auth/TokenService.php");
+        fs::write(
+            &target_file,
+            "<?php\nclass TokenService {\n    public function verify(): bool { return true; }\n}\n",
+        )
+        .expect("initial php");
+
+        let mut enricher = Enricher::new(
+            "claude",
+            root.to_str().expect("utf8"),
+            None,
+            &[],
+            None,
+            None,
+            false,
+        );
+
+        // Started Edit captures pre-edit baseline before file is modified on disk.
+        let mut start_edit = object!({
+            "kind": "tool",
+            "targets": {
+                "state": "started",
+                "tool": "Edit",
+                "call": "c1",
+                "path": target_file.to_str().expect("path"),
+            }
+        });
+        assert!(enricher.take(&mut start_edit, 0, 0).is_some());
+        let start_deltas = enricher.take_focus_events();
+        assert_eq!(start_deltas.len(), 1);
+        assert_eq!(start_deltas[0]["kind"], "graph_focus");
+        assert_eq!(start_deltas[0]["phase"], "active");
+        assert_eq!(
+            start_deltas[0]["target_paths"],
+            object!(["src/Auth/TokenService.php"])
+        );
+        assert!(
+            start_deltas[0]["created_entities"]
+                .as_array()
+                .is_some_and(Vec::is_empty)
+        );
+
+        // Simulate tool writing new method on disk before completed event.
+        fs::write(
+            &target_file,
+            "<?php\nclass TokenService {\n    public function verify(): bool { return true; }\n    public function rotateKey(): string { return 'secret-body'; }\n}\n",
+        )
+        .expect("updated php");
+
+        let mut done_edit = object!({
+            "kind": "tool",
+            "targets": {
+                "state": "completed",
+                "ok": true,
+                "tool": "Edit",
+                "call": "c1",
+                "path": target_file.to_str().expect("path"),
+            }
+        });
+        assert!(enricher.take(&mut done_edit, 1, 100).is_some());
+        let complete_deltas = enricher.take_focus_events();
+        assert_eq!(complete_deltas.len(), 1);
+        let delta = &complete_deltas[0];
+        assert_eq!(delta["kind"], "graph_focus");
+        assert_eq!(delta["phase"], "active");
+        assert!(!delta.to_string().contains("secret-body"));
+        assert_eq!(delta["created_entities"].as_array().map(Vec::len), Some(1));
+        assert_eq!(delta["created_entities"][0]["kind"], "method");
+        assert_eq!(delta["created_entities"][0]["name"], "rotateKey");
+        assert_eq!(delta["created_entities"][0]["parent"], "TokenService");
+
+        // Codex file_change adding a brand-new Rust file emits file + struct + impl method.
+        fs::create_dir_all(root.join("src/Http")).expect("http dir");
+        let guard_file = root.join("src/Http/guard.rs");
+        fs::write(
+            &guard_file,
+            "pub struct RouteGuard;\nimpl RouteGuard {\n    pub fn allow(&self) -> bool { true }\n}\n",
+        )
+        .expect("write rust");
+        let mut codex_change = object!({
+            "kind": "tool",
+            "targets": {
+                "state": "completed",
+                "ok": true,
+                "tool": "file_change",
+                "changes": [{"path": "src/Http/guard.rs", "kind": "add"}]
+            }
+        });
+        assert!(enricher.take(&mut codex_change, 2, 200).is_some());
+        let deltas = enricher.take_focus_events();
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(enricher.ledger.created_entities().len(), 4);
+        assert_eq!(enricher.ledger.target_paths().len(), 2);
+        assert_eq!(enricher.ledger.target_folders().len(), 2);
+        let receipt = enricher.ledger.receipt();
+        assert_eq!(
+            receipt["created_entities"].as_array().map(Vec::len),
+            Some(4)
+        );
+        assert!(!receipt.to_string().contains("secret-body"));
+    }
+
+    #[test]
+    fn strip_root_caches_compiled_regexes_and_ledger_normalizes_last_commands() {
+        let dir = TempDir::new().expect("temp dir");
+        let root_str = dir.path().to_string_lossy().into_owned();
+        let unique_root = format!("{root_str}/unique-strip-root-cache-case");
+        let cache_key = {
+            let mut key = norm(&unique_root, windows(&unique_root));
+            while key.ends_with('/') || key.ends_with('\\') {
+                key.pop();
+            }
+            key
+        };
+        let compiles_for = |key: &str| -> usize {
+            strip_root_regex_compile_counts()
+                .lock()
+                .unwrap()
+                .get(key)
+                .copied()
+                .unwrap_or(0)
+        };
+        assert_eq!(compiles_for(&cache_key), 0);
+
+        let enricher_a = Enricher::new("claude", &unique_root, None, &[], None, None, false);
+        let first = enricher_a
+            .text(&format!("cat {unique_root}/src/main.rs"), 200)
+            .unwrap();
+        assert_eq!(first, "cat src/main.rs");
+        assert_eq!(compiles_for(&cache_key), 6);
+
+        let second = enricher_a
+            .text(&format!("grep foo {unique_root}/src/lib.rs"), 200)
+            .unwrap();
+        assert_eq!(second, "grep foo src/lib.rs");
+        let enricher_b = Enricher::new("codex", &unique_root, None, &[], None, None, false);
+        let third = enricher_b
+            .text(&format!("ls {unique_root}/tests"), 200)
+            .unwrap();
+        assert_eq!(third, "ls tests");
+        assert_eq!(
+            compiles_for(&cache_key),
+            6,
+            "strip_root regexes must be cached across Enricher::text calls and instances"
+        );
+
+        let win_root = r"C:\Users\dev\repo-strip-root-win-mixed";
+        assert_eq!(
+            strip_root(
+                r"cat C:\Users\dev\repo-strip-root-win-mixed/src/main.rs",
+                &[win_root.to_owned()],
+                None
+            ),
+            "cat src/main.rs"
+        );
+        assert_eq!(
+            strip_root(
+                "type C:/Users/dev/repo-strip-root-win-mixed\\src\\lib.rs",
+                &[win_root.to_owned()],
+                None
+            ),
+            r"type src\lib.rs"
+        );
+        assert_eq!(compiles_for("C:/Users/dev/repo-strip-root-win-mixed"), 6);
+
+        assert_eq!(
+            normalize_command_signature("  cargo test   -p infra-harness 2>&1 | tail -n 20 "),
+            "cargo test -p infra-harness"
+        );
+        assert_eq!(
+            normalize_command_signature("cargo test -p infra-harness | head -n 5 >/dev/null"),
+            "cargo test -p infra-harness"
+        );
+
+        let mut ledger = RunLedger::new("claude", None, false);
+        for (idx, cmd, ok, code) in [
+            (
+                "c1",
+                "cargo test -p infra-harness 2>&1 | tail -n 20",
+                false,
+                101,
+            ),
+            (
+                "c2",
+                "cargo test   -p infra-harness | head -n 5",
+                false,
+                101,
+            ),
+            ("c3", "cargo test -p infra-harness >/dev/null", true, 0),
+        ] {
+            let start = object!({"tool": "Bash", "state": "started", "call": idx, "detail": cmd});
+            ledger.observe(&object!({}), Some(&start));
+            let done = object!({
+                "tool": "Bash",
+                "state": "completed",
+                "call": idx,
+                "ok": ok,
+                "exit_code": code,
+            });
+            ledger.observe(&object!({}), Some(&done));
+        }
+        let receipt = ledger.receipt();
+        let last = receipt["last_commands"].as_array().unwrap();
+        assert_eq!(last.len(), 3);
+        assert_eq!(last[0]["signature"], "cargo test -p infra-harness");
+        assert_eq!(last[1]["signature"], "cargo test -p infra-harness");
+        assert_eq!(last[2]["signature"], "cargo test -p infra-harness");
+        assert_eq!(last[0]["repeats"], 1);
+        assert_eq!(last[1]["repeats"], 2);
+        assert_eq!(last[2]["repeats"], 3);
+        assert_eq!(receipt["max_command_repeats"], 3);
+        assert_eq!(
+            receipt["command_loops"],
+            object!([{"signature": "cargo test -p infra-harness", "count": 3, "failed": 2}])
+        );
+    }
 }

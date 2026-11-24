@@ -11,6 +11,7 @@ crate-type = ["cdylib", "rlib"]
 wasm-bindgen = "=0.2.130"
 wasm-bindgen-futures = "=0.4.80"
 js-sys = "0.3"
+serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = { version = "=1.0.150" }
 regex = "1"
 
@@ -18,9 +19,12 @@ regex = "1"
 version = "0.3"
 features = [
   "Window", "Document", "Element", "Node", "NodeList", "Event", "EventTarget",
-  "KeyboardEvent", "MouseEvent", "PointerEvent", "HtmlElement", "HtmlInputElement",
+  "EventSource", "EventSourceInit", "MessageEvent",
+  "KeyboardEvent", "MouseEvent", "PointerEvent", "FocusEvent", "WheelEvent",
+  "AddEventListenerOptions", "HtmlElement", "HtmlInputElement",
   "HtmlSelectElement", "HtmlTextAreaElement", "HtmlFormElement", "HtmlDialogElement",
-  "HtmlDetailsElement", "HtmlAnchorElement", "HtmlCollection", "DomTokenList",
+  "HtmlDetailsElement", "HtmlAnchorElement", "HtmlCanvasElement", "HtmlCollection",
+  "CanvasRenderingContext2d", "DomTokenList",
   "CssStyleDeclaration", "DomRect", "Request", "RequestInit", "RequestCredentials",
   "RequestCache", "RequestMode", "Response", "Headers", "AbortController",
   "AbortSignal", "Storage", "Location", "History", "MediaQueryList", "File",

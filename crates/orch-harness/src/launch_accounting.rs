@@ -64,7 +64,7 @@ fn safe_name(value: &Value) -> Value {
         .unwrap_or(Value::Null)
 }
 fn ledger(value: &Value) -> Value {
-    let mut result = object!({"message":count(&value["message"]),"capsule":null,"excerpts":null,"attachments":null,"total":count(&value["total"]),"instructions":count(&value["instructions"])});
+    let mut result = object!({"message":count(&value["message"]),"capsule":null,"excerpts":null,"attachments":null,"omnigraph":count(&value["omnigraph"]),"total":count(&value["total"]),"instructions":count(&value["instructions"])});
     if value["capsule"].is_object() {
         let capsule = &value["capsule"];
         result["capsule"] = object!({"characters":count(&capsule["characters"]),"inserted":count(&capsule["inserted"]),"repeats":count(&capsule["repeats"]),"dropped":count(&capsule["dropped"]),"kinds":null,"items":null});
@@ -79,6 +79,11 @@ fn ledger(value: &Value) -> Value {
     }
     if value["attachments"].is_object() {
         result["attachments"] = object!({"characters":count(&value["attachments"]["characters"]),"count":count(&value["attachments"]["count"])});
+    }
+    // Only a turn that ran a SkillCache capsule has this category; any other
+    // launch's ledger keeps the shape it always had.
+    if value.get("skillcache").is_some_and(|size| !size.is_null()) {
+        result["skillcache"] = count(&value["skillcache"]).into();
     }
     result
 }
@@ -128,13 +133,11 @@ impl LaunchAccounting {
         generation: &str,
         project: &Path,
         source: &Path,
-        capsule: Option<&Value>,
+        _capsule: Option<&Value>,
     ) -> Self {
         let supported =
             native_workflow(session) && ["codex", "claude", "cursor"].contains(&provider);
-        let watch = capsule
-            .filter(|capsule| capsule.is_object() || capsule.is_array())
-            .map(|_| BTreeMap::new());
+        let watch = None;
         let root = project.to_string_lossy().to_string();
         let alias = session["project_path"].as_str();
         let home = crate::run_activity::user_home();
@@ -188,15 +191,12 @@ impl LaunchAccounting {
             })),
         }
     }
-    pub fn set_capsule(&self, capsule: Option<&Value>) {
+    pub fn set_capsule(&self, _capsule: Option<&Value>) {
         if let Ok(mut state) = self.inner.lock() {
             if state.finished {
                 return;
             }
-            let watch = capsule
-                .filter(|capsule| capsule.is_object() || capsule.is_array())
-                .map(|_| BTreeMap::new());
-            if !state.enricher.ledger.set_watch(watch)
+            if !state.enricher.ledger.set_watch(None)
                 && let Ok(mut observed) = state.observation.lock()
             {
                 observed.incomplete = true;

@@ -1,11 +1,14 @@
 //! Next-turn input and durable browser-side ownership of an uncertain POST.
-use crate::{api, dom, model as m, session};
+use crate::{api, commands, dom, model as m, session};
 use serde_json::{json, Value as V};
 
 /// Largest saved state `stored` reads back; `persist` never writes more.
 const STORED_LIMIT: usize = 150000;
 fn key(sid: &str) -> String {
     format!("infra-harness-inbox-v1:{sid}")
+}
+fn tab_draft_key(sid: &str) -> String {
+    format!("infra-harness-inbox-tab-draft-v1:{sid}")
 }
 fn cache(sid: &str) -> String {
     format!("inbox-receipts:{sid}")
@@ -53,24 +56,55 @@ pub fn unreadable() -> bool {
     !sid.is_empty() && stored(&sid)["invalid"] == true
 }
 pub fn eligible(v: &V) -> bool {
-    v["status"] == "running"
-        && v["workflow"] == "native"
-        && v["agents_enabled"] == false
-        && ["claude", "codex", "cursor"].contains(&v["provider"].as_str().unwrap_or(""))
-        && ["native_session_id", "git_common_dir"]
-            .iter()
-            .all(|k| v[*k].as_str().is_some_and(|s| !s.trim().is_empty()))
-        && [
-            "brain",
-            "sdd",
-            "fleet",
-            "clash",
-            "creator",
-            "system_run",
-            "system_discovery",
-        ]
-        .iter()
-        .all(|k| v[*k].is_null())
+    eligibility_reason(v).is_ok()
+}
+/// Why a session's live turn cannot take a next message now, with the codes
+/// the server's inbox uses; the page also needs the session's Git identity.
+pub fn eligibility_reason(v: &V) -> Result<(), &'static str> {
+    if v["status"] != "running" {
+        return Err("not_running");
+    }
+    if v["workflow"] != "native" {
+        return Err("non_native_workflow");
+    }
+    if v["agents_enabled"] != false {
+        return Err("agents_enabled");
+    }
+    if !v["brain"].is_null() {
+        return Err("brain_linked");
+    }
+    if [
+        "sdd",
+        "fleet",
+        "clash",
+        "creator",
+        "system_run",
+        "system_discovery",
+        "system_explain",
+    ]
+    .iter()
+    .any(|k| !v[*k].is_null())
+    {
+        return Err("specialized_workflow");
+    }
+    if !["claude", "codex", "cursor"].contains(&v["provider"].as_str().unwrap_or(""))
+        || !["plan", "edit"].contains(&v["mode"].as_str().unwrap_or(""))
+    {
+        return Err("unsupported_provider_or_mode");
+    }
+    if v["native_session_id"]
+        .as_str()
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err("missing_native_session_id");
+    }
+    if v["git_common_dir"]
+        .as_str()
+        .is_none_or(|s| s.trim().is_empty())
+    {
+        return Err("missing_git_identity");
+    }
+    Ok(())
 }
 pub fn has_pending(sid: &str) -> bool {
     m::array(&m::data(&cache(sid))["items"])
@@ -127,18 +161,40 @@ pub fn save_draft() {
     if draft.len() > 32000 {
         return;
     }
-    // A draft too large to read back is dropped rather than restoring an older one.
-    if draft.is_empty() || !persist(&sid, &json!({"draft":draft,"request":null})) {
-        let _ = persist(&sid, &V::Null);
+    if draft.is_empty() {
+        dom::save_session(&tab_draft_key(&sid), None);
+    } else {
+        dom::save_session(
+            &tab_draft_key(&sid),
+            Some(&json!({"draft": draft}).to_string()),
+        );
     }
 }
 pub fn restore(sid: &str) {
     let saved = stored(sid);
-    if let Some(draft) = saved["draft"].as_str().filter(|v| v.len() <= 32000) {
+    if unresolved(&saved) {
+        if let Some(draft) = saved["draft"].as_str().filter(|v| v.len() <= 32000) {
+            dom::set_value("prompt", draft);
+        }
+        return;
+    }
+    let tab_saved = dom::json_session_storage(&tab_draft_key(sid));
+    if let Some(draft) = tab_saved["draft"]
+        .as_str()
+        .or_else(|| saved["draft"].as_str())
+        .filter(|v| v.len() <= 32000)
+    {
         dom::set_value("prompt", draft);
     }
 }
 pub fn clear_draft(sid: &str, prompt: &str) {
+    let tab_saved = dom::json_session_storage(&tab_draft_key(sid));
+    if tab_saved["draft"]
+        .as_str()
+        .is_some_and(|v| v.trim() == prompt.trim())
+    {
+        dom::save_session(&tab_draft_key(sid), None);
+    }
     let saved = stored(sid);
     if !unresolved(&saved)
         && saved["draft"]
@@ -265,7 +321,10 @@ pub async fn submit() {
     } else if let Some(identity) = m::secure_request_identity() {
         identity
     } else {
-        dom::error("composer-error", "Secure message identities are unavailable in this browser. Reconnect before queueing a message.");
+        dom::error(
+            "composer-error",
+            "Secure message identities are unavailable in this browser. Reconnect before queueing a message.",
+        );
         return;
     };
     let attempt = match request(&saved, &sid, &raw, &identity) {
@@ -277,10 +336,14 @@ pub async fn submit() {
     };
     let durable = json!({"draft":attempt["prompt"],"request":attempt});
     if !persist(&sid, &durable) {
-        dom::error("composer-error", "Could not save the retry identity in this browser. Enable local storage, or shorten the message, before queueing it.");
+        dom::error(
+            "composer-error",
+            "Could not save the retry identity in this browser. Enable local storage, or shorten the message, before queueing it.",
+        );
         return;
     }
     stop();
+    commands::close();
     m::write(|s| s.pending = true);
     session::controls();
     dom::error("composer-error", "");
@@ -298,7 +361,10 @@ pub async fn submit() {
         }
         Ok(_) => {
             if owner(&sid, epoch) {
-                dom::error("composer-error", "The runner returned an invalid receipt. Retry saving with the same message identity.");
+                dom::error(
+                    "composer-error",
+                    "The runner returned an invalid receipt. Retry saving with the same message identity.",
+                );
             }
         }
         Err(error) => {
@@ -358,7 +424,11 @@ pub async fn refresh(sid: &str, epoch: u64) {
                     dom::error("composer-error", "");
                 }
             } else {
-                refresh_failed(sid, "Could not verify the next-message receipts. Refresh before queueing another message.", true);
+                refresh_failed(
+                    sid,
+                    "Could not verify the next-message receipts. Refresh before queueing another message.",
+                    true,
+                );
             }
         }
         Err(error)
@@ -420,6 +490,15 @@ fn status(value: &str) -> &'static str {
         _ => "Delivery uncertain — review before continuing",
     }
 }
+const INBOX_VISIBLE_RECEIPTS: usize = 5;
+
+pub(crate) fn earlier_receipts_notice(total_items: usize) -> Option<String> {
+    total_items
+        .checked_sub(INBOX_VISIBLE_RECEIPTS)
+        .filter(|hidden| *hidden > 0)
+        .map(|hidden| format!("+{hidden} earlier"))
+}
+
 pub fn render() {
     let (sid, selected, pending) = m::read(|s| {
         (
@@ -436,7 +515,12 @@ pub fn render() {
     };
     let unknown = unresolved(&saved);
     dom::hidden("session-inbox", items.is_empty() && !unknown);
-    let projection = json!({"sid":sid,"items":items.iter().take(5).collect::<Vec<_>>(),"request":saved["request"],"invalid":saved["invalid"],"disabled":pending});
+    let visible_items = items
+        .iter()
+        .take(INBOX_VISIBLE_RECEIPTS)
+        .collect::<Vec<_>>();
+    let hidden_count = items.len().saturating_sub(INBOX_VISIBLE_RECEIPTS);
+    let projection = json!({"sid":sid,"items":visible_items,"hidden_count":hidden_count,"request":saved["request"],"invalid":saved["invalid"],"disabled":pending});
     if m::data("inbox-render") != projection {
         m::set("inbox-render", projection);
         dom::clear("inbox-receipts");
@@ -465,11 +549,18 @@ pub fn render() {
                         saved["request"]["prompt"].as_str().unwrap_or(""),
                     ),
                 );
-                dom::add(&card, &dom::el("p", "knowledge-note", "This message may already be saved. Retry saving before sending another message; its identity will stay the same. If the runner never saved it, its text returns to the composer."));
+                dom::add(
+                    &card,
+                    &dom::el(
+                        "p",
+                        "knowledge-note",
+                        "This message may already be saved. Retry saving before sending another message; its identity will stay the same. If the runner never saved it, its text returns to the composer.",
+                    ),
+                );
             }
             dom::append("inbox-receipts", &card);
         }
-        for item in items.iter().take(5) {
+        for item in items.iter().take(INBOX_VISIBLE_RECEIPTS) {
             let card = dom::el("li", "inbox-receipt", "");
             dom::add(
                 &card,
@@ -508,6 +599,13 @@ pub fn render() {
             }
             dom::append("inbox-receipts", &card);
         }
+        if let Some(notice) = earlier_receipts_notice(items.len()) {
+            let more = dom::el("li", "inbox-receipt inbox-receipt-more", "");
+            let label = dom::el("p", "knowledge-note", &notice);
+            let _ = label.set_attribute("data-inbox-earlier", &hidden_count.to_string());
+            dom::add(&more, &label);
+            dom::append("inbox-receipts", &more);
+        }
     }
     let hint = if saved["invalid"] == true {
         "Clear the unreadable saved state before sending another message."
@@ -517,6 +615,8 @@ pub fn render() {
         "A next message is already queued. Cancel it before queueing another."
     } else if eligible(&selected) {
         "Plain text only. This message runs after the current turn finishes successfully, with the same settings."
+    } else if eligibility_reason(&selected) == Err("brain_linked") {
+        "This session prepares its linked task's context before each message, so the next one waits until this turn ends."
     } else {
         ""
     };
@@ -534,7 +634,31 @@ pub fn render() {
 mod tests {
     use super::*;
     fn session() -> V {
-        json!({"id":"a","status":"running","workflow":"native","provider":"claude","agents_enabled":false,"native_session_id":"n","git_common_dir":"/repo/.git"})
+        json!({"id":"a","status":"running","workflow":"native","provider":"claude","mode":"edit","agents_enabled":false,"native_session_id":"n","git_common_dir":"/repo/.git"})
+    }
+    #[test]
+    fn eligibility_reason_reports_system_explain_and_brain_linked() {
+        assert_eq!(eligibility_reason(&session()), Ok(()));
+        let with = |field: &str, value: V| {
+            let mut changed = session();
+            changed[field] = value;
+            eligibility_reason(&changed)
+        };
+        assert_eq!(with("brain", json!({"task_id":"T-1"})), Err("brain_linked"));
+        assert_eq!(
+            with("system_explain", json!({"question":"why"})),
+            Err("specialized_workflow")
+        );
+        assert_eq!(
+            with("mode", json!("review")),
+            Err("unsupported_provider_or_mode")
+        );
+        assert_eq!(with("mode", V::Null), Err("unsupported_provider_or_mode"));
+        assert_eq!(
+            with("git_common_dir", json!(" ")),
+            Err("missing_git_identity")
+        );
+        assert_eq!(with("status", json!("queued")), Err("not_running"));
     }
     #[test]
     fn eligibility_excludes_queued_unknown_and_special_authority() {
@@ -648,5 +772,9 @@ mod tests {
         assert!(track(&json!({"items":[]}), true));
         assert!(!track(&json!({"items":[{"status":"completed"}]}), false));
         assert!(!track(&json!({"error":true,"retry":false}), false));
+        assert_eq!(earlier_receipts_notice(0), None);
+        assert_eq!(earlier_receipts_notice(5), None);
+        assert_eq!(earlier_receipts_notice(6).as_deref(), Some("+1 earlier"));
+        assert_eq!(earlier_receipts_notice(9).as_deref(), Some("+4 earlier"));
     }
 }

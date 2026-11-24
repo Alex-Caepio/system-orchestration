@@ -686,7 +686,7 @@ pub fn dispatch_receipt(directory: &Path, state: &Value, step: &Value) -> Result
             "ok",
             "report",
         ],
-        &["rejection", "failure"],
+        &["rejection", "failure", "usage_components", "deterministic"],
     )?;
     if ["rejection", "failure"].iter().any(|key| {
         receipt
@@ -755,4 +755,1407 @@ pub fn task_id(run: &str, change: &str, sid: &str) -> String {
 }
 pub fn run_summary(state: &Value, directory: &Path) -> Value {
     object!({"kind":state["kind"],"run_id":state["run_id"],"change_id":state["change_id"],"run_dir":directory,"status":state["status"],"error":state["error"],"provider":state["provider"],"mode":state["mode"],"access":access_scope(state),"steps":state["steps"],"tasks":state["tasks"].as_object().map(|tasks|tasks.iter().map(|(sid,task)|(sid.clone(),object!({"external_id":task["external_id"],"uuid":task["uuid"],"closed":texts(&state["closed_tasks"]).contains(sid)}))).collect::<serde_json::Map<_,_>>()).unwrap_or_default(),"meaning":"Historical dispatch state; checks and completion are worker-reported"})
+}
+
+/// Output cap matching `infra_skillcache::tool::STDOUT_BYTES`.
+pub const PROGRAM_STDOUT_BYTES: usize = 256 * 1024;
+/// Failure diagnostic summary cap matching `infra_skillcache::tool::DIAGNOSTIC_BYTES`.
+pub const PROGRAM_DIAGNOSTIC_BYTES: usize = 4 * 1024;
+
+fn add_opt_u64(target: &mut Option<u64>, add: Option<u64>) {
+    if let Some(value) = add {
+        *target = Some(target.unwrap_or(0).saturating_add(value));
+    }
+}
+
+fn opt_u64(value: &Value) -> Option<u64> {
+    value.as_u64()
+}
+
+#[derive(Clone, Debug, Default)]
+struct ComponentCounts {
+    input_tokens: Option<u64>,
+    output_tokens: Option<u64>,
+    cache_read_input_tokens: Option<u64>,
+    cache_write_5m_input_tokens: Option<u64>,
+    cache_write_1h_input_tokens: Option<u64>,
+    model_calls: Option<u64>,
+}
+
+impl ComponentCounts {
+    fn add(&mut self, other: &Self) {
+        add_opt_u64(&mut self.input_tokens, other.input_tokens);
+        add_opt_u64(&mut self.output_tokens, other.output_tokens);
+        add_opt_u64(
+            &mut self.cache_read_input_tokens,
+            other.cache_read_input_tokens,
+        );
+        add_opt_u64(
+            &mut self.cache_write_5m_input_tokens,
+            other.cache_write_5m_input_tokens,
+        );
+        add_opt_u64(
+            &mut self.cache_write_1h_input_tokens,
+            other.cache_write_1h_input_tokens,
+        );
+        add_opt_u64(&mut self.model_calls, other.model_calls);
+    }
+
+    fn to_json(&self, source: Option<&str>) -> Value {
+        object!({
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_input_tokens": self.cache_read_input_tokens,
+            "cache_write_5m_input_tokens": self.cache_write_5m_input_tokens,
+            "cache_write_1h_input_tokens": self.cache_write_1h_input_tokens,
+            "model_calls": self.model_calls,
+            "source": source,
+        })
+    }
+}
+
+fn claude_message_counts(usage: &Value) -> ComponentCounts {
+    let cache = &usage["cache_creation"];
+    let mut write_5m = opt_u64(&cache["ephemeral_5m_input_tokens"]);
+    let write_1h = opt_u64(&cache["ephemeral_1h_input_tokens"]);
+    if write_5m.is_none() && write_1h.is_none() {
+        write_5m = opt_u64(&usage["cache_creation_input_tokens"]);
+    }
+    ComponentCounts {
+        input_tokens: opt_u64(&usage["input_tokens"]),
+        output_tokens: opt_u64(&usage["output_tokens"]),
+        cache_read_input_tokens: opt_u64(&usage["cache_read_input_tokens"]),
+        cache_write_5m_input_tokens: write_5m,
+        cache_write_1h_input_tokens: write_1h,
+        model_calls: Some(1),
+    }
+}
+
+fn codex_turn_counts(usage: &Value) -> ComponentCounts {
+    let cached = opt_u64(&usage["cached_input_tokens"]);
+    let input = opt_u64(&usage["input_tokens"]).map(|raw| match cached {
+        Some(read) => raw.saturating_sub(read),
+        None => raw,
+    });
+    ComponentCounts {
+        input_tokens: input,
+        output_tokens: opt_u64(&usage["output_tokens"]),
+        cache_read_input_tokens: cached,
+        cache_write_5m_input_tokens: None,
+        cache_write_1h_input_tokens: None,
+        model_calls: Some(1),
+    }
+}
+
+/// Normalizes provider token telemetry into `UsageComponents` per system step receipt,
+/// matching `infra_harness::cost_observation::UsageComponents`.
+pub struct StepUsageTracker {
+    provider: String,
+    claude_messages: std::collections::BTreeMap<String, ComponentCounts>,
+    claude_result_outputs: Vec<Option<u64>>,
+    codex_totals: ComponentCounts,
+    cursor_calls: std::collections::BTreeSet<String>,
+}
+
+impl StepUsageTracker {
+    pub fn new(provider: &str) -> Self {
+        Self {
+            provider: provider.to_owned(),
+            claude_messages: std::collections::BTreeMap::new(),
+            claude_result_outputs: Vec::new(),
+            codex_totals: ComponentCounts::default(),
+            cursor_calls: std::collections::BTreeSet::new(),
+        }
+    }
+
+    pub fn observe(&mut self, event: &Value) {
+        let kind = event["type"].as_str().unwrap_or("");
+        match self.provider.as_str() {
+            "claude" if kind == "assistant" => {
+                let msg = &event["message"];
+                let usage = &msg["usage"];
+                if !usage.is_object() {
+                    return;
+                }
+                let id = msg["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| format!("msg-{}", self.claude_messages.len()));
+                let mut counts = claude_message_counts(usage);
+                counts.output_tokens = None;
+                self.claude_messages.insert(id, counts);
+            }
+            "claude" if kind == "result" => {
+                self.claude_result_outputs
+                    .push(opt_u64(&event["usage"]["output_tokens"]));
+            }
+            "codex" if kind == "turn.completed" && event["usage"].is_object() => {
+                self.codex_totals.add(&codex_turn_counts(&event["usage"]));
+            }
+            "cursor" if kind == "assistant" => {
+                if let Some(call_id) = event["model_call_id"].as_str().filter(|id| !id.is_empty()) {
+                    self.cursor_calls.insert(call_id.to_owned());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn snapshot(&self) -> Value {
+        let mut total = ComponentCounts::default();
+        match self.provider.as_str() {
+            "claude" => {
+                for counts in self.claude_messages.values() {
+                    total.add(counts);
+                }
+                total.output_tokens = match self.claude_result_outputs.as_slice() {
+                    [Some(output)] => Some(*output),
+                    _ => None,
+                };
+            }
+            "codex" => total.add(&self.codex_totals),
+            "cursor" => {
+                let calls = self.cursor_calls.len() as u64;
+                if calls > 0 {
+                    total.model_calls = Some(calls);
+                }
+            }
+            _ => {}
+        }
+        let source = ["claude", "codex", "cursor"]
+            .contains(&self.provider.as_str())
+            .then_some(self.provider.as_str());
+        total.to_json(source)
+    }
+}
+
+/// Returns zero-token / zero-call `usage_components` for deterministic steps,
+/// or null-valued components for unknown/unobserved LLM steps.
+pub fn empty_usage_components(source: Option<&str>, model_calls: u64) -> Value {
+    if source == Some("deterministic") && model_calls == 0 {
+        ComponentCounts {
+            input_tokens: Some(0),
+            output_tokens: Some(0),
+            cache_read_input_tokens: Some(0),
+            cache_write_5m_input_tokens: Some(0),
+            cache_write_1h_input_tokens: Some(0),
+            model_calls: Some(0),
+        }
+        .to_json(Some("deterministic"))
+    } else {
+        ComponentCounts::default().to_json(source)
+    }
+}
+
+/// Extracts normalized `usage_components` from a step's raw worker NDJSON stream.
+pub fn usage_components_from_raw(raw: &[u8], provider: &str) -> Value {
+    let mut tracker = StepUsageTracker::new(provider);
+    for line in String::from_utf8_lossy(raw).lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Ok(event) = serde_json::from_str::<Value>(trimmed) {
+            tracker.observe(&event);
+        }
+    }
+    tracker.snapshot()
+}
+
+pub struct DeterministicVerifyOutcome {
+    pub all_passed: bool,
+    pub checks: Vec<Value>,
+    pub diagnostics_summary: String,
+    pub duration_seconds: f64,
+}
+
+fn bound_diagnostic(raw: &str, cap: usize) -> String {
+    let masked = match orch_core::domain::mask_secrets(raw) {
+        Ok((text, _)) => text,
+        Err(_) => "[diagnostics withheld: a possible secret could not be masked]".into(),
+    };
+    let trimmed = masked.trim();
+    if trimmed.len() <= cap {
+        return trimmed.to_owned();
+    }
+    let mut end = cap;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    trimmed[..end].to_owned()
+}
+
+/// Executes deterministic verification checks declared on the `verify` plan step
+/// inside a network-off `Profile::Gate` sandbox with scrubbed environment and bounded output.
+pub async fn run_deterministic_verify_checks(
+    specs: &[Value],
+    state: &Value,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    runner_lock: Option<std::sync::Arc<std::fs::File>>,
+) -> Result<DeterministicVerifyOutcome> {
+    run_deterministic_verify_checks_cached(specs, state, cancel, runner_lock, None).await
+}
+
+const VERIFY_RACY_NS: i128 = 2_000_000_000;
+
+fn time_to_unix_ns(time: std::time::SystemTime) -> Option<i128> {
+    match time.duration_since(std::time::UNIX_EPOCH) {
+        Ok(delta) => i128::try_from(delta.as_nanos()).ok(),
+        Err(err) => i128::try_from(err.duration().as_nanos())
+            .ok()
+            .and_then(|ns| ns.checked_neg()),
+    }
+}
+
+fn now_unix_ns() -> i128 {
+    time_to_unix_ns(std::time::SystemTime::now()).unwrap_or(0)
+}
+
+#[cfg(test)]
+fn verify_tree_stamp(root: &Path) -> Option<(String, i128)> {
+    verify_tree_stamp_tier(root, &[], None).map(|(_, stamp, mtime)| (stamp, mtime))
+}
+
+fn resolve_state_dir_from_health_db(health_db: &Path) -> Option<PathBuf> {
+    let mut cur = health_db.parent();
+    for _ in 0..4 {
+        let candidate = cur?;
+        if candidate.join("graphs").is_dir() || candidate.join("sessions.sqlite3").is_file() {
+            return Some(candidate.to_path_buf());
+        }
+        cur = candidate.parent();
+    }
+    None
+}
+
+fn root_command_basename(cmd: &str) -> String {
+    cmd.rsplit(['\\', '/'])
+        .next()
+        .unwrap_or(cmd)
+        .to_ascii_lowercase()
+}
+
+fn stat_regular_non_symlink(path: &Path) -> Option<(u64, i128)> {
+    let meta = std::fs::symlink_metadata(path).ok()?;
+    if meta.file_type().is_symlink() || !meta.is_file() {
+        return None;
+    }
+    let mtime = meta.modified().ok().and_then(time_to_unix_ns)?;
+    Some((meta.len(), mtime))
+}
+
+fn scoped_closure_files(root: &Path, argv: &[String]) -> Option<Vec<PathBuf>> {
+    let exe = root_command_basename(argv.first()?);
+    let args = &argv[1..];
+    match exe.as_str() {
+        "composer" => {
+            let subcmd = args.iter().find(|a| !a.starts_with('-'))?.as_str();
+            if subcmd != "validate" {
+                return None;
+            }
+            let mut closure = Vec::new();
+            let composer = root.join("composer.json");
+            if !composer.is_file() {
+                return None;
+            }
+            closure.push(composer);
+            let lock = root.join("composer.lock");
+            if lock.exists() {
+                closure.push(lock);
+            }
+            Some(closure)
+        }
+        "php" => {
+            if !args.iter().any(|a| a == "-l" || a == "--syntax-check")
+                || args
+                    .iter()
+                    .any(|a| matches!(a.as_str(), "-r" | "-f" | "-B" | "-R" | "-E" | "-F"))
+            {
+                return None;
+            }
+            let mut targets = Vec::new();
+            let mut i = 0;
+            while i < args.len() {
+                let arg = &args[i];
+                if matches!(arg.as_str(), "-c" | "-d" | "-z") {
+                    i += 2;
+                    continue;
+                }
+                if arg.starts_with('-') {
+                    i += 1;
+                    continue;
+                }
+                let p = root.join(arg);
+                let canon = orch_core::fs::canonicalize(&p).ok()?;
+                if !canon.starts_with(root) || !canon.is_file() {
+                    return None;
+                }
+                targets.push(p);
+                i += 1;
+            }
+            (!targets.is_empty()).then_some(targets)
+        }
+        _ => None,
+    }
+}
+
+fn find_graph_ir_db(root: &Path, state_dir: &Path) -> Option<PathBuf> {
+    let canon = orch_core::fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let sessions_db = state_dir.join("sessions.sqlite3");
+    let mut candidate_ids: Vec<String> = Vec::new();
+    if sessions_db.is_file()
+        && let Ok(conn) = rusqlite::Connection::open_with_flags(
+            &sessions_db,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        && let Ok(mut stmt) = conn.prepare("SELECT id, path FROM registered_projects")
+        && let Ok(rows) = stmt.query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })
+    {
+        for (pid, raw_path) in rows.flatten() {
+            let reg_canon = orch_core::fs::canonicalize(Path::new(&raw_path))
+                .unwrap_or_else(|_| PathBuf::from(&raw_path));
+            if reg_canon == canon {
+                candidate_ids.push(pid);
+            }
+        }
+    }
+    let root_hash16 = &digest(canon.to_string_lossy().as_bytes())[..16];
+    candidate_ids.push(format!("sys-{root_hash16}"));
+    candidate_ids.push(root_hash16.to_string());
+
+    for pid in candidate_ids {
+        let db = state_dir.join("graphs").join(&pid).join("graph_ir.sqlite3");
+        if db.is_file() {
+            return Some(db);
+        }
+    }
+    None
+}
+
+fn git_dirty_entries(root: &Path) -> Option<Vec<String>> {
+    let out = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(["status", "--porcelain", "-z", "-uall"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let mut entries = Vec::new();
+    for raw in out.stdout.split(|b| *b == 0) {
+        if raw.is_empty() {
+            continue;
+        }
+        let s = String::from_utf8_lossy(raw);
+        if s.len() > 3 {
+            entries.push(s[3..].to_string());
+        } else {
+            entries.push(s.into_owned());
+        }
+    }
+    entries.sort();
+    Some(entries)
+}
+
+fn try_ir_tree_stamp(root: &Path, state_dir: &Path) -> Option<(&'static str, String, i128)> {
+    let db_path = find_graph_ir_db(root, state_dir)?;
+    let conn = rusqlite::Connection::open_with_flags(
+        &db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    let write_epoch: String = conn
+        .query_row(
+            "SELECT value FROM ir_meta WHERE key = 'write_epoch'",
+            [],
+            |r| r.get(0),
+        )
+        .ok()?;
+    let mut stmt = conn
+        .prepare("SELECT path, size, mtime_ns FROM ir_files ORDER BY path ASC")
+        .ok()?;
+    let rows: Vec<(String, i64, i64)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+        .ok()?
+        .collect::<std::result::Result<Vec<_>, _>>()
+        .ok()?;
+    if rows.is_empty() {
+        return None;
+    }
+
+    let mut max_mtime: i128 = root
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(time_to_unix_ns)
+        .unwrap_or(0);
+    let ir_max_mtime: i128 = rows
+        .iter()
+        .map(|(_, _, m)| i128::from(*m))
+        .max()
+        .unwrap_or(0);
+    max_mtime = max_mtime.max(ir_max_mtime);
+
+    if let Some(head) = crate::catalog::git_head(root)
+        && let Some(dirty) = git_dirty_entries(root)
+    {
+        let mut parts = vec![
+            format!("ir_epoch:{write_epoch}"),
+            format!("ir_count:{}", rows.len()),
+            format!("git_head:{head}"),
+        ];
+        for rel in dirty {
+            let full = root.join(&rel);
+            if let Ok(meta) = std::fs::symlink_metadata(&full) {
+                if meta.file_type().is_symlink() {
+                    return None;
+                }
+                if meta.is_file() {
+                    let mtime = meta.modified().ok().and_then(time_to_unix_ns)?;
+                    max_mtime = max_mtime.max(mtime);
+                    parts.push(format!("dirty:{rel}:{}:{mtime}", meta.len()));
+                } else {
+                    parts.push(format!("dirty:{rel}:other"));
+                }
+            } else {
+                parts.push(format!("dirty:{rel}:missing"));
+            }
+        }
+        for manifest_rel in [
+            "composer.json",
+            "composer.lock",
+            "package.json",
+            "package-lock.json",
+            "pnpm-lock.yaml",
+            "yarn.lock",
+            "Cargo.toml",
+            "Cargo.lock",
+            "pyproject.toml",
+            "go.mod",
+        ] {
+            let path = root.join(manifest_rel);
+            if let Some((len, mtime)) = stat_regular_non_symlink(&path) {
+                max_mtime = max_mtime.max(mtime);
+                parts.push(format!("manifest:{manifest_rel}:{len}:{mtime}"));
+            }
+        }
+        return Some(("ir_git", digest(parts.join("\n").as_bytes()), max_mtime));
+    }
+
+    // Non-Git fallback: verify every indexed file and its parent directory against the IR DB.
+    let mut seen_dirs = std::collections::BTreeSet::new();
+    let mut parts = vec![
+        format!("ir_epoch:{write_epoch}"),
+        format!("ir_count:{}", rows.len()),
+    ];
+    for (rel, expected_size, expected_mtime) in rows {
+        let full = root.join(&rel);
+        let (len, mtime) = stat_regular_non_symlink(&full)?;
+        if i64::try_from(len).ok() != Some(expected_size) || i128::from(expected_mtime) != mtime {
+            return None;
+        }
+        max_mtime = max_mtime.max(mtime);
+        if let Some(parent) = full.parent()
+            && seen_dirs.insert(parent.to_path_buf())
+            && let Some(dir_mtime) = parent
+                .metadata()
+                .ok()
+                .and_then(|m| m.modified().ok())
+                .and_then(time_to_unix_ns)
+        {
+            if dir_mtime > ir_max_mtime {
+                return None;
+            }
+            max_mtime = max_mtime.max(dir_mtime);
+        }
+        parts.push(format!("{rel}:{len}:{mtime}"));
+    }
+    Some(("ir_indexed", digest(parts.join("\n").as_bytes()), max_mtime))
+}
+
+pub fn verify_tree_stamp_tier(
+    root: &Path,
+    argv: &[String],
+    state_dir: Option<&Path>,
+) -> Option<(&'static str, String, i128)> {
+    // Tier 1: exact scoped file closure for self-contained commands (composer validate, php -l).
+    if let Some(files) = scoped_closure_files(root, argv) {
+        let mut max_mtime: i128 = 0;
+        let mut parts = Vec::with_capacity(files.len() + 1);
+        for file in files {
+            let (len, mtime) = stat_regular_non_symlink(&file)?;
+            max_mtime = max_mtime.max(mtime);
+            let rel = file
+                .strip_prefix(root)
+                .ok()?
+                .to_string_lossy()
+                .replace('\\', "/");
+            parts.push(format!("{rel}:{len}:{mtime}"));
+        }
+        parts.sort();
+        let head = crate::catalog::git_head(root).unwrap_or_default();
+        parts.push(format!("git_head:{head}"));
+        return Some((
+            "scoped_files",
+            digest(parts.join("\n").as_bytes()),
+            max_mtime,
+        ));
+    }
+
+    // Tier 2: Graph-IR revision / indexed stat snapshot (no 3000-file walk).
+    if let Some(state) = state_dir
+        && let Some(ir_stamp) = try_ir_tree_stamp(root, state)
+    {
+        return Some(ir_stamp);
+    }
+
+    // Tier 3: bounded directory walk fallback when no narrower scope or Graph-IR store exists.
+    const MAX_FILES: usize = 3000;
+    let mut queue = std::collections::VecDeque::from([root.to_path_buf()]);
+    let mut entries = Vec::new();
+    let mut max_mtime = root
+        .metadata()
+        .ok()
+        .and_then(|m| m.modified().ok())
+        .and_then(time_to_unix_ns)
+        .unwrap_or(0);
+    while let Some(dir) = queue.pop_front() {
+        let mut sorted: Vec<_> = std::fs::read_dir(&dir)
+            .ok()?
+            .filter_map(|e| e.ok())
+            .collect();
+        sorted.sort_by_key(|e| e.file_name());
+        for entry in sorted {
+            let name = entry.file_name();
+            let name_s = name.to_string_lossy();
+            if matches!(
+                name_s.as_ref(),
+                ".git" | "target" | "vendor" | "node_modules" | ".phpunit.cache" | ".infra-work"
+            ) {
+                continue;
+            }
+            let path = entry.path();
+            let meta = std::fs::symlink_metadata(&path).ok()?;
+            if meta.file_type().is_symlink() {
+                return None;
+            }
+            if meta.is_dir() {
+                queue.push_back(path);
+            } else if meta.is_file() {
+                let mtime = meta.modified().ok().and_then(time_to_unix_ns)?;
+                max_mtime = max_mtime.max(mtime);
+                let rel = path
+                    .strip_prefix(root)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                entries.push(format!("{rel}:{}:{mtime}", meta.len()));
+                if entries.len() >= MAX_FILES {
+                    return None;
+                }
+            }
+        }
+    }
+    let head = crate::catalog::git_head(root).unwrap_or_default();
+    entries.push(format!("git_head:{head}"));
+    Some((
+        "bounded_walk",
+        digest(entries.join("\n").as_bytes()),
+        max_mtime,
+    ))
+}
+
+fn ensure_system_ledger(db_path: &Path) -> Result<rusqlite::Connection> {
+    if let Some(parent) = db_path.parent() {
+        orch_core::fs::ensure_directory(parent, true)?;
+    }
+    let conn = rusqlite::Connection::open(db_path)?;
+    conn.busy_timeout(Duration::from_secs(2))?;
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS workflow_health_runs(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            model TEXT NOT NULL,
+            run_key TEXT NOT NULL,
+            step_id TEXT NOT NULL,
+            outcome TEXT NOT NULL,
+            schema_error INTEGER NOT NULL DEFAULT 0,
+            deopt INTEGER NOT NULL DEFAULT 0,
+            duration_seconds REAL NOT NULL DEFAULT 0.0,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS workflow_health_lookup
+            ON workflow_health_runs(workflow, provider, model, id DESC);
+        CREATE TABLE IF NOT EXISTS verify_step_receipts(
+            cache_key TEXT PRIMARY KEY,
+            name TEXT NOT NULL,
+            detail TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );",
+    )?;
+    Ok(conn)
+}
+
+pub const HEALTH_DECAY: f64 = 0.82;
+pub const HEALTH_PRIOR_ALPHA: f64 = 0.25;
+pub const HEALTH_PRIOR_WEIGHT: f64 = 1.5;
+pub const HEALTH_HISTORY_LIMIT: usize = 50;
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SystemHealthSummary {
+    pub total_runs: usize,
+    pub schema_error_runs: usize,
+    pub deopt_runs: usize,
+    pub schema_error_rate: f64,
+    pub deopt_rate: f64,
+    pub warnings: Vec<String>,
+}
+
+impl SystemHealthSummary {
+    pub fn is_degraded(&self) -> bool {
+        self.total_runs >= 3 && (self.schema_error_rate > 0.25 || self.deopt_rate > 0.30)
+    }
+
+    pub fn recommended_max_attempts(&self, base_limit: u64) -> u64 {
+        if !self.is_degraded() {
+            return base_limit;
+        }
+        if self.schema_error_rate > 0.50 || self.deopt_rate > 0.50 {
+            base_limit.min(2)
+        } else {
+            base_limit.min(4)
+        }
+    }
+
+    pub fn recommended_concurrency(&self, base_concurrency: usize) -> usize {
+        let base = base_concurrency.max(1);
+        if !self.is_degraded() {
+            return base;
+        }
+        if self.schema_error_rate > 0.50 || self.deopt_rate > 0.50 {
+            1
+        } else {
+            (base / 2).max(1)
+        }
+    }
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "Tracks per-step system workflow health cleanly in SQLite."
+)]
+pub fn record_system_health(
+    db_path: &Path,
+    workflow: &str,
+    provider: &str,
+    model: Option<&str>,
+    run_key: &str,
+    step_id: &str,
+    outcome: &str,
+    schema_error: bool,
+    deopt: bool,
+    duration_seconds: f64,
+) {
+    let Ok(conn) = ensure_system_ledger(db_path) else {
+        return;
+    };
+    let _ = conn.execute(
+        "INSERT INTO workflow_health_runs(workflow,provider,model,run_key,step_id,outcome,schema_error,deopt,duration_seconds,created_at)
+         VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)",
+        rusqlite::params![
+            workflow,
+            provider,
+            model.unwrap_or("default"),
+            run_key,
+            step_id,
+            outcome,
+            i64::from(schema_error),
+            i64::from(deopt),
+            duration_seconds,
+            now(),
+        ],
+    );
+}
+
+pub fn summarize_system_health(
+    db_path: &Path,
+    workflow: &str,
+    provider: &str,
+    model: Option<&str>,
+) -> SystemHealthSummary {
+    let mut summary = SystemHealthSummary::default();
+    let Ok(conn) = ensure_system_ledger(db_path) else {
+        return summary;
+    };
+    let model_key = model.unwrap_or("default");
+    let Ok(mut stmt) = conn.prepare(
+        "SELECT schema_error, deopt FROM workflow_health_runs WHERE workflow=?1 AND provider=?2 AND model=?3 ORDER BY id DESC LIMIT ?4",
+    ) else {
+        return summary;
+    };
+    let Ok(rows) = stmt.query_map(
+        rusqlite::params![workflow, provider, model_key, HEALTH_HISTORY_LIMIT as i64],
+        |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
+    ) else {
+        return summary;
+    };
+    let mut total_weight = 0.0_f64;
+    let mut weighted_schema = 0.0_f64;
+    let mut weighted_deopt = 0.0_f64;
+    for (idx, row) in rows.flatten().enumerate() {
+        let weight = HEALTH_DECAY.powi(idx as i32);
+        summary.total_runs += 1;
+        total_weight += weight;
+        if row.0 != 0 {
+            summary.schema_error_runs += 1;
+            weighted_schema += weight;
+        }
+        if row.1 != 0 {
+            summary.deopt_runs += 1;
+            weighted_deopt += weight;
+        }
+    }
+    if summary.total_runs > 0 {
+        let denom = total_weight + HEALTH_PRIOR_WEIGHT;
+        summary.schema_error_rate = (weighted_schema + HEALTH_PRIOR_ALPHA) / denom;
+        summary.deopt_rate = (weighted_deopt + HEALTH_PRIOR_ALPHA) / denom;
+    }
+    if summary.total_runs >= 3 {
+        if summary.schema_error_rate > 0.25 {
+            summary.warnings.push(format!(
+                "High schema error rate for {workflow}/{provider}/{model_key}: {:.0}% smoothed ({}/{} recent)",
+                summary.schema_error_rate * 100.0,
+                summary.schema_error_runs,
+                summary.total_runs
+            ));
+        }
+        if summary.deopt_rate > 0.30 {
+            summary.warnings.push(format!(
+                "Degraded ROI/deopt warning for {workflow}/{provider}/{model_key}: {:.0}% smoothed ({}/{} recent)",
+                summary.deopt_rate * 100.0,
+                summary.deopt_runs,
+                summary.total_runs
+            ));
+        }
+    }
+    summary
+}
+
+/// Selects a healthier tracked model for `(workflow, provider)` when the requested model
+/// exhibits degraded smoothed health and another model has >= 3 runs and healthy metrics.
+pub fn select_healthier_model(
+    db_path: &Path,
+    workflow: &str,
+    provider: &str,
+    requested_model: Option<&str>,
+) -> Option<String> {
+    let current = summarize_system_health(db_path, workflow, provider, requested_model);
+    if !current.is_degraded() {
+        return None;
+    }
+    let current_key = requested_model.unwrap_or("default");
+    let current_score = current.schema_error_rate + current.deopt_rate;
+    let conn = ensure_system_ledger(db_path).ok()?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT model FROM workflow_health_runs WHERE workflow=?1 AND provider=?2 AND model != 'default' ORDER BY model ASC",
+        )
+        .ok()?;
+    let candidates: Vec<String> = stmt
+        .query_map(rusqlite::params![workflow, provider], |r| r.get(0))
+        .ok()?
+        .flatten()
+        .collect();
+    let mut best: Option<(f64, String)> = None;
+    for candidate in candidates {
+        if candidate == current_key {
+            continue;
+        }
+        let health = summarize_system_health(db_path, workflow, provider, Some(&candidate));
+        if health.total_runs < 3 || health.is_degraded() {
+            continue;
+        }
+        let score = health.schema_error_rate + health.deopt_rate;
+        if score + 0.10 >= current_score {
+            continue;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|(best_score, best_name)| (score, &candidate) < (*best_score, best_name))
+        {
+            best = Some((score, candidate));
+        }
+    }
+    best.map(|(_, model)| model)
+}
+
+/// Executes deterministic verification checks with `VERIFY_RACY_NS`-guarded cross-run
+/// receipt reuse backed by `health_db` (SQLite `verify_step_receipts`).
+pub async fn run_deterministic_verify_checks_cached(
+    specs: &[Value],
+    state: &Value,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    runner_lock: Option<std::sync::Arc<std::fs::File>>,
+    health_db: Option<&Path>,
+) -> Result<DeterministicVerifyOutcome> {
+    run_deterministic_verify_checks_at(
+        specs,
+        state,
+        cancel,
+        runner_lock,
+        health_db,
+        now_unix_ns(),
+        None,
+    )
+    .await
+}
+
+type VerifyStepExec<'a> = &'a (
+        dyn Fn(
+    &[String],
+    &Path,
+    &std::collections::BTreeMap<String, String>,
+) -> std::result::Result<(i32, String), (String, String)>
+            + Sync
+    );
+
+async fn run_deterministic_verify_checks_at(
+    specs: &[Value],
+    state: &Value,
+    cancel: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    runner_lock: Option<std::sync::Arc<std::fs::File>>,
+    health_db: Option<&Path>,
+    now_ns: i128,
+    custom_runner: Option<VerifyStepExec<'_>>,
+) -> Result<DeterministicVerifyOutcome> {
+    let started = std::time::Instant::now();
+    let mut checks = Vec::with_capacity(specs.len());
+    let mut failure_lines = Vec::new();
+    let mut all_passed = true;
+    let disable_cache = std::env::var("HARNESS_DISABLE_CHECK_CACHE").as_deref() == Ok("1");
+
+    for (index, item) in specs.iter().take(MAX_ITEMS).enumerate() {
+        fields(item, &["name", "argv"], &["cwd_service", "timeout_seconds"])?;
+        let name = text(&item["name"], "program check name", 200)?;
+        let argv = texts(&item["argv"]);
+        if argv.is_empty() {
+            return Err(fail(format!(
+                "Deterministic verify check `{name}` has empty argv"
+            )));
+        }
+        let cwd_service = item["cwd_service"].as_str().unwrap_or("__system__");
+        let root_str = state["roots"][cwd_service].as_str().ok_or_else(|| {
+            fail(format!(
+                "Unknown service root `{cwd_service}` for check `{name}`"
+            ))
+        })?;
+        let cwd_canon = orch_core::fs::canonicalize(root_str)?;
+        let timeout = item["timeout_seconds"].as_u64().unwrap_or(60).clamp(1, 600);
+
+        let mut readable = Vec::new();
+        if let Some(roots_obj) = state["roots"].as_object() {
+            for (_, val) in roots_obj {
+                if let Some(s) = val.as_str()
+                    && let Ok(canon) = orch_core::fs::canonicalize(s)
+                    && !canon.starts_with(&cwd_canon)
+                    && !readable.contains(&canon)
+                {
+                    readable.push(canon);
+                }
+            }
+        }
+        let path_env = std::env::var("PATH").ok();
+        let env =
+            orch_host::sandbox::scrub_env(std::env::vars(), &std::collections::BTreeMap::new());
+        let state_dir = health_db.and_then(resolve_state_dir_from_health_db);
+        let cache_key = if !disable_cache {
+            health_db.and_then(|_| {
+                let (_tier, tree_digest, max_mtime) =
+                    verify_tree_stamp_tier(&cwd_canon, &argv, state_dir.as_deref())?;
+                (max_mtime > 0 && now_ns > VERIFY_RACY_NS && max_mtime <= now_ns - VERIFY_RACY_NS)
+                    .then(|| {
+                        let env_digest =
+                            digest(serde_json::to_vec(&env).unwrap_or_default().as_slice());
+                        digest(
+                            object!({
+                                "name": &name,
+                                "argv": &argv,
+                                "cwd": cwd_canon.to_string_lossy(),
+                                "timeout": timeout,
+                                "env": env_digest,
+                                "tree": tree_digest,
+                            })
+                            .to_string()
+                            .as_bytes(),
+                        )
+                    })
+            })
+        } else {
+            None
+        };
+        if let (Some(db_path), Some(key)) = (health_db, cache_key.as_deref())
+            && let Ok(conn) = ensure_system_ledger(db_path)
+            && let Ok(Some(detail)) = rusqlite::OptionalExtension::optional(conn.query_row(
+                "SELECT detail FROM verify_step_receipts WHERE cache_key=?1",
+                [key],
+                |r| r.get::<_, String>(0),
+            ))
+        {
+            checks.push(
+                object!({"name": name, "status": "passed", "detail": detail, "cached": true}),
+            );
+            continue;
+        }
+
+        let wrapped = if orch_host::sandbox::available() {
+            let spec = orch_host::sandbox::Spec {
+                workspace: cwd_canon.clone(),
+                target: cwd_canon.clone(),
+                protected: vec![],
+                readable,
+                accounts: vec![],
+                runtime: orch_host::sandbox::runtime_dirs_for_argv(&argv, path_env.as_deref()),
+                codex: None,
+                evidence: None,
+                network: false,
+            };
+            orch_host::sandbox::gate(&spec, &argv).map_err(host)?
+        } else {
+            argv.clone()
+        };
+
+        let (result, raw) = if let Some(runner) = custom_runner {
+            match runner(&wrapped, &cwd_canon, &env) {
+                Ok((code, out)) => (Ok(code), out),
+                Err((code, msg)) => (Err((code, msg)), String::new()),
+            }
+        } else {
+            let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let sink = captured.clone();
+            let res = orch_host::process::run_raw_with_lock(
+                &wrapped,
+                &cwd_canon,
+                &env,
+                &[],
+                orch_host::process::Limits {
+                    seconds: Some(timeout),
+                    output: PROGRAM_STDOUT_BYTES,
+                    line: PROGRAM_STDOUT_BYTES,
+                },
+                cancel.clone(),
+                runner_lock.clone(),
+                move |chunk| {
+                    let mut out = sink.lock().map_err(|_| {
+                        orch_host::HarnessError::unavailable("Program check capture lock failed")
+                    })?;
+                    let left = PROGRAM_STDOUT_BYTES.saturating_sub(out.len());
+                    out.extend_from_slice(&chunk[..chunk.len().min(left)]);
+                    Ok(())
+                },
+            )
+            .await;
+            let raw = captured
+                .lock()
+                .map(|guard| String::from_utf8_lossy(&guard).into_owned())
+                .unwrap_or_default();
+            let mapped = match res {
+                Ok(output) => Ok(output.code),
+                Err(error) => Err((error.code.to_string(), error.message)),
+            };
+            (mapped, raw)
+        };
+        let bounded = bound_diagnostic(&raw, PROGRAM_DIAGNOSTIC_BYTES);
+        match result {
+            Ok(0) => {
+                let detail = if bounded.is_empty() {
+                    format!("passed (check {})", index + 1)
+                } else {
+                    bounded
+                };
+                if let (Some(db_path), Some(key)) = (health_db, cache_key.as_deref())
+                    && let Ok(conn) = ensure_system_ledger(db_path)
+                {
+                    let _ = conn.execute(
+                        "INSERT INTO verify_step_receipts(cache_key,name,detail,created_at) VALUES(?1,?2,?3,?4)
+                         ON CONFLICT(cache_key) DO UPDATE SET detail=excluded.detail,created_at=excluded.created_at",
+                        rusqlite::params![key, &name, &detail, now()],
+                    );
+                }
+                checks.push(object!({"name": name, "status": "passed", "detail": detail}));
+            }
+            Ok(code) => {
+                all_passed = false;
+                let reason = format!("exited with code {code}");
+                let detail = if bounded.is_empty() {
+                    reason
+                } else {
+                    format!("{reason}: {bounded}")
+                };
+                let detail = bound_diagnostic(&detail, 2000);
+                failure_lines.push(format!("- [{name}] {detail}"));
+                checks.push(object!({"name": name, "status": "failed", "detail": detail}));
+            }
+            Err((code, message)) => {
+                all_passed = false;
+                let detail =
+                    bound_diagnostic(&format!("execution failed ({code}): {message}"), 2000);
+                failure_lines.push(format!("- [{name}] {detail}"));
+                checks.push(object!({"name": name, "status": "failed", "detail": detail}));
+            }
+        }
+    }
+
+    let diagnostics_summary = bound_diagnostic(&failure_lines.join("\n"), PROGRAM_DIAGNOSTIC_BYTES);
+    Ok(DeterministicVerifyOutcome {
+        all_passed,
+        checks,
+        diagnostics_summary,
+        duration_seconds: (started.elapsed().as_secs_f64() * 1000.0).round() / 1000.0,
+    })
+}
+
+#[cfg(test)]
+mod usage_components_tests {
+    use super::*;
+
+    #[test]
+    fn step_usage_tracker_dedupes_claude_messages_and_normalizes_codex() {
+        let claude_raw = concat!(
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":100,\"cache_read_input_tokens\":400,\"cache_creation\":{\"ephemeral_5m_input_tokens\":50,\"ephemeral_1h_input_tokens\":10}}}}\n",
+            "{\"type\":\"assistant\",\"message\":{\"id\":\"m1\",\"usage\":{\"input_tokens\":120,\"cache_read_input_tokens\":400,\"cache_creation\":{\"ephemeral_5m_input_tokens\":50,\"ephemeral_1h_input_tokens\":10}}}}\n",
+            "{\"type\":\"result\",\"usage\":{\"output_tokens\":33}}\n"
+        );
+        let parsed = usage_components_from_raw(claude_raw.as_bytes(), "claude");
+        assert_eq!(parsed["input_tokens"], 120);
+        assert_eq!(parsed["output_tokens"], 33);
+        assert_eq!(parsed["cache_read_input_tokens"], 400);
+        assert_eq!(parsed["cache_write_5m_input_tokens"], 50);
+        assert_eq!(parsed["cache_write_1h_input_tokens"], 10);
+        assert_eq!(parsed["model_calls"], 1);
+        assert_eq!(parsed["source"], "claude");
+
+        let codex_raw = concat!(
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":500,\"cached_input_tokens\":200,\"output_tokens\":25}}\n",
+            "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":100,\"cached_input_tokens\":25,\"output_tokens\":10}}\n"
+        );
+        let codex_parsed = usage_components_from_raw(codex_raw.as_bytes(), "codex");
+        assert_eq!(codex_parsed["input_tokens"], 375);
+        assert_eq!(codex_parsed["cache_read_input_tokens"], 225);
+        assert_eq!(codex_parsed["output_tokens"], 35);
+        assert_eq!(codex_parsed["model_calls"], 2);
+
+        let det = empty_usage_components(Some("deterministic"), 0);
+        assert_eq!(det["model_calls"], 0);
+        assert_eq!(det["input_tokens"], 0);
+        assert_eq!(det["source"], "deterministic");
+
+        let cursor_raw = concat!(
+            "{\"type\":\"assistant\",\"model_call_id\":\"mc1\"}\n",
+            "{\"type\":\"assistant\",\"model_call_id\":\"mc1\"}\n",
+            "{\"type\":\"assistant\",\"model_call_id\":\"mc2\"}\n",
+            "{\"type\":\"assistant\",\"model_call_id\":\"\"}\n",
+            "{\"type\":\"result\",\"subtype\":\"success\"}\n"
+        );
+        let cursor_parsed = usage_components_from_raw(cursor_raw.as_bytes(), "cursor");
+        assert_eq!(cursor_parsed["model_calls"], 2);
+        assert_eq!(cursor_parsed["input_tokens"], Value::Null);
+        assert_eq!(cursor_parsed["output_tokens"], Value::Null);
+        assert_eq!(cursor_parsed["cache_read_input_tokens"], Value::Null);
+        assert_eq!(cursor_parsed["source"], "cursor");
+
+        let cursor_empty =
+            usage_components_from_raw(b"{\"type\":\"result\",\"subtype\":\"success\"}\n", "cursor");
+        assert_eq!(cursor_empty["model_calls"], Value::Null);
+        assert_eq!(cursor_empty["source"], "cursor");
+    }
+
+    #[tokio::test]
+    async fn system_health_ledger_and_verify_receipt_cache_respect_racy_ns() {
+        let dir = std::env::temp_dir().join(format!("infra-sys-health-{}", uuid::Uuid::new_v4()));
+        let svc = dir.join("svc");
+        std::fs::create_dir_all(&svc).unwrap();
+        std::fs::write(svc.join("ok.txt"), "v1\n").unwrap();
+        let db = dir.join("system_health.sqlite3");
+
+        for i in 0..4 {
+            record_system_health(
+                &db,
+                "system",
+                "codex",
+                Some("gpt-5"),
+                &format!("r-{i}"),
+                "verify",
+                if i < 2 { "blocked" } else { "completed" },
+                i < 2,
+                i < 2,
+                1.0,
+            );
+        }
+        let health = summarize_system_health(&db, "system", "codex", Some("gpt-5"));
+        assert_eq!(health.total_runs, 4);
+        assert_eq!(health.schema_error_runs, 2);
+        assert!(
+            health
+                .warnings
+                .iter()
+                .any(|w| w.contains("schema error rate"))
+        );
+        assert!(health.warnings.iter().any(|w| w.contains("ROI/deopt")));
+
+        let svc_canon = orch_core::fs::canonicalize(&svc).unwrap();
+        let (_digest, max_mtime) = verify_tree_stamp(&svc_canon).unwrap();
+        let argv = if cfg!(windows) {
+            object!(["cmd", "/C", "echo verify-ok"])
+        } else {
+            object!(["/bin/sh", "-c", "echo verify-ok"])
+        };
+        let specs = vec![object!({
+            "name": "svc:echo",
+            "argv": argv,
+            "cwd_service": "svc",
+            "timeout_seconds": 10
+        })];
+        let state = object!({"roots": {"svc": svc.to_string_lossy().as_ref()}});
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let exec_calls = std::sync::atomic::AtomicUsize::new(0);
+        let run_local = |wrapped: &[String],
+                         cwd: &Path,
+                         env: &std::collections::BTreeMap<String, String>|
+         -> std::result::Result<(i32, String), (String, String)> {
+            exec_calls.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let out = std::process::Command::new(&wrapped[0])
+                .args(&wrapped[1..])
+                .current_dir(cwd)
+                .env_clear()
+                .envs(env)
+                .output()
+                .map_err(|e| ("spawn".to_owned(), e.to_string()))?;
+            let mut text = String::from_utf8_lossy(&out.stdout).into_owned();
+            text.push_str(&String::from_utf8_lossy(&out.stderr));
+            Ok((out.status.code().unwrap_or(1), text))
+        };
+
+        // Inside VERIFY_RACY_NS window -> never reads/writes cache.
+        let racy = run_deterministic_verify_checks_at(
+            &specs,
+            &state,
+            cancel.clone(),
+            None,
+            Some(&db),
+            max_mtime + VERIFY_RACY_NS - 1,
+            Some(&run_local),
+        )
+        .await
+        .unwrap();
+        assert!(racy.all_passed, "racy failed: {:?}", racy.checks);
+        assert!(racy.checks[0].get("cached").is_none());
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+
+        // Outside VERIFY_RACY_NS -> first executes live, second hits SQLite receipt cache.
+        let settled_now = max_mtime + VERIFY_RACY_NS + 100;
+        let first = run_deterministic_verify_checks_at(
+            &specs,
+            &state,
+            cancel.clone(),
+            None,
+            Some(&db),
+            settled_now,
+            Some(&run_local),
+        )
+        .await
+        .unwrap();
+        assert!(first.all_passed, "first failed: {:?}", first.checks);
+        assert!(first.checks[0].get("cached").is_none());
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        let second = run_deterministic_verify_checks_at(
+            &specs,
+            &state,
+            cancel.clone(),
+            None,
+            Some(&db),
+            settled_now + 10,
+            Some(&run_local),
+        )
+        .await
+        .unwrap();
+        assert!(second.all_passed);
+        assert_eq!(second.checks[0]["cached"], true);
+        assert_eq!(second.checks[0]["detail"], first.checks[0]["detail"]);
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::Relaxed), 2);
+
+        // Modifying workspace file invalidates cached verify receipt cleanly.
+        std::fs::write(svc.join("ok.txt"), "v2\n").unwrap();
+        let (_new_digest, new_mtime) = verify_tree_stamp(&svc_canon).unwrap();
+        let third = run_deterministic_verify_checks_at(
+            &specs,
+            &state,
+            cancel,
+            None,
+            Some(&db),
+            new_mtime + VERIFY_RACY_NS + 100,
+            Some(&run_local),
+        )
+        .await
+        .unwrap();
+        assert!(third.all_passed);
+        assert!(third.checks[0].get("cached").is_none());
+        assert_eq!(exec_calls.load(std::sync::atomic::Ordering::Relaxed), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn exponential_health_weights_decay_old_failures_and_select_healthier_model() {
+        let dir =
+            std::env::temp_dir().join(format!("infra-sys-health-decay-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("system_health.sqlite3");
+
+        // Record 3 bad runs on flaky-model, then 5 good runs -> exponential decay heals score.
+        for i in 0..3 {
+            record_system_health(
+                &db,
+                "system",
+                "codex",
+                Some("flaky-model"),
+                &format!("bad-{i}"),
+                "verify",
+                "blocked",
+                true,
+                true,
+                1.0,
+            );
+        }
+        let degraded = summarize_system_health(&db, "system", "codex", Some("flaky-model"));
+        assert!(degraded.is_degraded(), "{degraded:?}");
+        assert_eq!(degraded.recommended_max_attempts(100), 2);
+        assert_eq!(degraded.recommended_concurrency(4), 1);
+
+        // Also record 4 healthy runs on steady-model.
+        for i in 0..4 {
+            record_system_health(
+                &db,
+                "system",
+                "codex",
+                Some("steady-model"),
+                &format!("good-{i}"),
+                "verify",
+                "completed",
+                false,
+                false,
+                0.5,
+            );
+        }
+        assert_eq!(
+            select_healthier_model(&db, "system", "codex", Some("flaky-model")).as_deref(),
+            Some("steady-model")
+        );
+
+        // 8 consecutive recent good runs on flaky-model outweigh the 3 old failures.
+        for i in 0..8 {
+            record_system_health(
+                &db,
+                "system",
+                "codex",
+                Some("flaky-model"),
+                &format!("recover-{i}"),
+                "verify",
+                "completed",
+                false,
+                false,
+                0.5,
+            );
+        }
+        let recovered = summarize_system_health(&db, "system", "codex", Some("flaky-model"));
+        assert!(!recovered.is_degraded(), "{recovered:?}");
+        assert!(recovered.warnings.is_empty(), "{recovered:?}");
+        assert_eq!(recovered.recommended_max_attempts(100), 100);
+        assert_eq!(
+            select_healthier_model(&db, "system", "codex", Some("flaky-model")),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn verify_tree_stamp_tier_prefers_scoped_and_graph_ir_over_walk() {
+        let dir =
+            std::env::temp_dir().join(format!("infra-sys-stamp-tier-{}", uuid::Uuid::new_v4()));
+        let ws = dir.join("ws");
+        let state = dir.join("state");
+        std::fs::create_dir_all(ws.join("src")).unwrap();
+        std::fs::write(ws.join("composer.json"), r#"{"name":"acme/ws"}"#).unwrap();
+        std::fs::write(ws.join("composer.lock"), "{}").unwrap();
+        std::fs::write(ws.join("src/App.php"), "<?php\n").unwrap();
+        std::fs::write(ws.join("unrelated.txt"), "noise-1\n").unwrap();
+
+        let ws_canon = orch_core::fs::canonicalize(&ws).unwrap();
+
+        // Tier 1: `composer validate` depends only on composer.{json,lock}, ignoring unrelated files.
+        let composer_argv = vec![
+            "composer".into(),
+            "validate".into(),
+            "--no-interaction".into(),
+        ];
+        let (tier1, digest1, _) =
+            verify_tree_stamp_tier(&ws_canon, &composer_argv, Some(&state)).unwrap();
+        assert_eq!(tier1, "scoped_files");
+        std::fs::write(ws.join("unrelated.txt"), "noise-2\n").unwrap();
+        let (_, digest1_after, _) =
+            verify_tree_stamp_tier(&ws_canon, &composer_argv, Some(&state)).unwrap();
+        assert_eq!(digest1, digest1_after);
+        std::fs::write(
+            ws.join("composer.json"),
+            r#"{"name":"acme/ws","version":"1.0"}"#,
+        )
+        .unwrap();
+        let (_, digest1_changed, _) =
+            verify_tree_stamp_tier(&ws_canon, &composer_argv, Some(&state)).unwrap();
+        assert_ne!(digest1, digest1_changed);
+
+        // Tier 1 also handles `php -l src/App.php`.
+        let php_argv = vec!["php".into(), "-l".into(), "src/App.php".into()];
+        let (php_tier, _, _) = verify_tree_stamp_tier(&ws_canon, &php_argv, Some(&state)).unwrap();
+        assert_eq!(php_tier, "scoped_files");
+
+        // Tier 2: Graph-IR database present with synthetic `sys-<sha16>` avoids bounded walk.
+        let root_hash16 = &digest(ws_canon.to_string_lossy().as_bytes())[..16];
+        let ir_home = state.join("graphs").join(format!("sys-{root_hash16}"));
+        std::fs::create_dir_all(&ir_home).unwrap();
+        let ir_db = ir_home.join("graph_ir.sqlite3");
+        let conn = rusqlite::Connection::open(&ir_db).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE ir_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE ir_files(path TEXT PRIMARY KEY, language TEXT NOT NULL, size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL, content_sha256 TEXT NOT NULL, namespace TEXT, indexed_at TEXT NOT NULL);
+             INSERT INTO ir_meta(key, value) VALUES ('write_epoch', '7');",
+        )
+        .unwrap();
+        let app_meta = std::fs::symlink_metadata(ws.join("src/App.php")).unwrap();
+        let app_mtime = time_to_unix_ns(app_meta.modified().unwrap()).unwrap();
+        conn.execute(
+            "INSERT INTO ir_files(path, language, size, mtime_ns, content_sha256, namespace, indexed_at) VALUES(?1,'php',?2,?3,'abc','','now')",
+            rusqlite::params!["src/App.php", i64::try_from(app_meta.len()).unwrap(), i64::try_from(app_mtime).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+
+        let generic_argv = vec!["vendor/bin/phpunit".into()];
+        let (tier2, ir_digest, _) =
+            verify_tree_stamp_tier(&ws_canon, &generic_argv, Some(&state)).unwrap();
+        assert_eq!(tier2, "ir_indexed");
+        assert!(!ir_digest.is_empty());
+
+        // Tier 3: without Graph-IR state_dir or narrow closure, falls back to bounded_walk.
+        let (tier3, _, _) = verify_tree_stamp_tier(&ws_canon, &generic_argv, None).unwrap();
+        assert_eq!(tier3, "bounded_walk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

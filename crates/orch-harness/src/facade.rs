@@ -458,6 +458,7 @@ async fn serve(args: &[String], source: PathBuf, assets: BTreeMap<String, Asset>
         session_concurrency,
         projects,
         providers,
+        path_env: std::env::var_os("PATH"),
     };
     let (shutdown_tx, _) = tokio::sync::watch::channel(false);
     let control = Arc::new(ServerControl {

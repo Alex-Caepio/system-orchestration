@@ -130,22 +130,32 @@ pub fn consumer() -> Result<()> {
     Ok(())
 }
 
-pub fn trial(scenario: &Scenario, recovery: bool, rounds: usize) -> Result<Value> {
+pub fn trial(
+    scenario: &Scenario,
+    redis_endpoint: Option<std::net::SocketAddr>,
+    recovery: bool,
+    rounds: usize,
+) -> Result<Value> {
     if rounds == 0 || rounds > 1000 {
         bail!("pilot_rounds")
     }
     let prior = scenario.prior()?;
     let first = scenario.state["steps"][0].clone();
-    let mut memory = scenario.memory(Box::new(SqliteStore::open(
+    let mut local = scenario.memory(Box::new(SqliteStore::open(
         &scenario.directory.join("sqlite-view"),
     )?))?;
-    let observations = scenario.observations(&memory)?;
-    let accepted = memory.append(
+    let observations = scenario.observations(&local)?;
+    let accepted = local.append(
         &scenario.state,
         &first,
         &observations,
         Duration::from_secs(3600),
     )?;
+    let mut stores = vec![("B", local)];
+    if let Some(endpoint) = redis_endpoint {
+        let _ = endpoint;
+        bail!("redis_pilot_not_bundled")
+    }
     let baseline = native::prompt_for(
         &scenario.state,
         &scenario.plan,
@@ -153,8 +163,20 @@ pub fn trial(scenario: &Scenario, recovery: bool, rounds: usize) -> Result<Value
         &prior,
         None,
     )?;
-    let (view, read) = memory.prompt(&scenario.state, &scenario.plan, &scenario.step, &prior)?;
-    let inputs = [("A", baseline, "disabled"), ("B", view, read.backend)];
+    let mut inputs = vec![("A", baseline, "disabled")];
+    let mut snapshots = vec![];
+    for (name, memory) in &mut stores {
+        let (prompt, read) =
+            memory.prompt(&scenario.state, &scenario.plan, &scenario.step, &prior)?;
+        snapshots.push(read.snapshot);
+        inputs.push((*name, prompt, read.backend));
+    }
+    if snapshots.len() == 2 && snapshots[0] != snapshots[1] {
+        bail!("pilot_snapshot_parity")
+    }
+    if inputs.len() == 3 && inputs[1].1 != inputs[2].1 {
+        bail!("pilot_prompt_parity")
+    }
     let mut results = vec![];
     for (arm, prompt, backend) in &inputs {
         let mut child = Command::new(std::env::current_exe()?)
@@ -200,7 +222,11 @@ pub fn trial(scenario: &Scenario, recovery: bool, rounds: usize) -> Result<Value
     }
     let mut timing = BTreeMap::<&str, Vec<f64>>::new();
     for round in 0..rounds {
-        let order = if round % 2 == 0 { [0, 1] } else { [1, 0] };
+        let order = if round % 2 == 0 {
+            (0..inputs.len()).collect::<Vec<_>>()
+        } else {
+            (0..inputs.len()).rev().collect()
+        };
         for i in order {
             let name = inputs[i].0;
             let start = std::time::Instant::now();
@@ -213,7 +239,12 @@ pub fn trial(scenario: &Scenario, recovery: bool, rounds: usize) -> Result<Value
                     None,
                 )?;
             } else {
-                memory.prompt(&scenario.state, &scenario.plan, &scenario.step, &prior)?;
+                stores
+                    .iter_mut()
+                    .find(|(arm, _)| *arm == name)
+                    .context("pilot_arm")?
+                    .1
+                    .prompt(&scenario.state, &scenario.plan, &scenario.step, &prior)?;
             }
             timing
                 .entry(name)
@@ -222,6 +253,6 @@ pub fn trial(scenario: &Scenario, recovery: bool, rounds: usize) -> Result<Value
         }
     }
     Ok(
-        json!({"scope":"deterministic mechanics; no live agents or task-outcome efficacy","default_enabled":false,"journal_accepted":accepted.accepted,"journal_replayed":accepted.replayed,"arms":results,"prompt_build_ms":timing,"rounds":rounds,"recovery":recovery,"adoption":"awaits sealed held-out task-outcome evidence"}),
+        json!({"scope":"deterministic mechanics/parity; no live agents or task-outcome efficacy","default_enabled":false,"journal_accepted":accepted.accepted,"journal_replayed":accepted.replayed,"arms":results,"BC_snapshot_equal":if snapshots.len()==2{Some(snapshots[0]==snapshots[1])}else{None},"BC_prompt_equal":if inputs.len()==3{Some(inputs[1].1==inputs[2].1)}else{None},"prompt_build_ms":timing,"rounds":rounds,"recovery":recovery,"adoption":"awaits sealed held-out task-outcome evidence"}),
     )
 }

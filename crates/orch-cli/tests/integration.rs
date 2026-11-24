@@ -42,10 +42,10 @@ fn rpc(stdin: &mut impl Write, reader: &mut impl BufRead, req: Value) -> Value {
 }
 
 #[test]
-fn mcp_tools_list_exposes_all_18_tools() {
+fn mcp_tools_list_exposes_all_25_tools() {
     let list = orch_cli::mcp::tools_list();
     let tools = list["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 18);
+    assert_eq!(tools.len(), 25);
     let names = tools
         .iter()
         .map(|t| t["name"].as_str().unwrap().to_string())
@@ -69,6 +69,13 @@ fn mcp_tools_list_exposes_all_18_tools() {
         "orch_delivery_preview",
         "orch_working_memory_read",
         "orch_working_memory_write",
+        "omnigraph_status",
+        "omnigraph_atoms",
+        "omnigraph_publish",
+        "omnigraph_branches_diff",
+        "omnigraph_merge_keep",
+        "system_graph_status",
+        "orch_permission_mode",
     ] {
         assert!(names.contains(expected), "missing MCP tool {expected}");
     }
@@ -211,7 +218,20 @@ fn binary_cli_and_mcp_stdio_roundtrip() {
         &mut stdout,
         json!({ "jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {} }),
     );
-    assert_eq!(list["result"]["tools"].as_array().unwrap().len(), 18);
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 25);
+    let tool_names: Vec<&str> = tools.iter().filter_map(|t| t["name"].as_str()).collect();
+    for expected in [
+        "omnigraph_status",
+        "omnigraph_atoms",
+        "omnigraph_publish",
+        "omnigraph_branches_diff",
+        "omnigraph_merge_keep",
+        "system_graph_status",
+        "orch_permission_mode",
+    ] {
+        assert!(tool_names.contains(&expected), "missing MCP tool {expected}");
+    }
 
     let s_init = rpc(
         &mut stdin,
@@ -384,9 +404,192 @@ fn binary_cli_and_mcp_stdio_roundtrip() {
         "completed"
     );
 
+    let sg_status = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "system_graph_status",
+                "arguments": { "project": sys_dir, "check": true }
+            }
+        }),
+    );
+    assert_eq!(sg_status["result"]["isError"], false, "{sg_status}");
+
+    let omni_status = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "omnigraph_status",
+                "arguments": { "project": repo }
+            }
+        }),
+    );
+    assert_eq!(omni_status["result"]["isError"], false, "{omni_status}");
+    assert_eq!(omni_status["result"]["structuredContent"]["mode"], "off");
+
+    let omni_atoms = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {
+                "name": "omnigraph_atoms",
+                "arguments": { "project": repo, "q": "loopback", "limit": 20 }
+            }
+        }),
+    );
+    assert_eq!(omni_atoms["result"]["isError"], false, "{omni_atoms}");
+    assert_eq!(omni_atoms["result"]["structuredContent"]["connected"], false);
+    assert_eq!(omni_atoms["result"]["structuredContent"]["limit"], 20);
+
+    for (id, tool, args) in [
+        (
+            12,
+            "omnigraph_publish",
+            json!({
+                "project": repo,
+                "atom_id": "mcp-atom-1",
+                "kind": "decision",
+                "title": "Isolate HTTP bridge on loopback"
+            }),
+        ),
+        (
+            130,
+            "omnigraph_atoms",
+            json!({ "project": repo, "q": "loopback", "search": true }),
+        ),
+        (
+            14,
+            "omnigraph_branches_diff",
+            json!({ "project": repo, "source": "feat/test", "target": "main" }),
+        ),
+    ] {
+        let res = rpc(
+            &mut stdin,
+            &mut stdout,
+            json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": { "name": tool, "arguments": args }
+            }),
+        );
+        assert_eq!(res["result"]["isError"], true, "{tool}: {res}");
+        assert!(
+            res["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap_or("")
+                .contains("mode=off"),
+            "{tool}: {res}"
+        );
+    }
+
+    let sess_start = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 15,
+            "method": "tools/call",
+            "params": {
+                "name": "orch_session_start",
+                "arguments": {
+                    "project": repo,
+                    "prompt": "Inspect config",
+                    "workflow": "plan",
+                    "mode": "plan",
+                    "permissions": "manual"
+                }
+            }
+        }),
+    );
+    assert_eq!(sess_start["result"]["isError"], false, "{sess_start}");
+    let sid = sess_start["result"]["structuredContent"]["session"]["id"]
+        .as_str()
+        .expect("started session id")
+        .to_owned();
+
+    let perm_update = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 16,
+            "method": "tools/call",
+            "params": {
+                "name": "orch_permission_mode",
+                "arguments": {
+                    "project": repo,
+                    "session_id": sid,
+                    "mode": "auto"
+                }
+            }
+        }),
+    );
+    assert_eq!(perm_update["result"]["isError"], false, "{perm_update}");
+    assert_eq!(
+        perm_update["result"]["structuredContent"]["permissions"],
+        "auto"
+    );
+
+    let keep_err = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 17,
+            "method": "tools/call",
+            "params": {
+                "name": "omnigraph_merge_keep",
+                "arguments": {
+                    "project": repo,
+                    "atom_id": "mcp-atom-1",
+                    "from": "main",
+                    "to": "main"
+                }
+            }
+        }),
+    );
+    assert_eq!(keep_err["result"]["isError"], true, "{keep_err}");
+
     drop(stdin);
     let status = mcp.wait().unwrap();
     assert!(status.success());
+
+    // CLI smoke for `omnigraph`, `session permission`, and `system graph-status`
+    let cli_omni = Command::new(bin())
+        .args(["omnigraph", "status", "--project"])
+        .arg(&repo)
+        .output()
+        .unwrap();
+    assert!(cli_omni.status.success(), "{}", String::from_utf8_lossy(&cli_omni.stderr));
+
+    let cli_perm = Command::new(bin())
+        .args(["session", "permission", "--project"])
+        .arg(&repo)
+        .args(["--id", &sid, "--mode", "bypass"])
+        .output()
+        .unwrap();
+    assert!(cli_perm.status.success(), "{}", String::from_utf8_lossy(&cli_perm.stderr));
+    let cli_perm_json: Value = serde_json::from_slice(&cli_perm.stdout).unwrap();
+    assert_eq!(cli_perm_json["permissions"], "bypass");
+
+    let cli_sg = Command::new(bin())
+        .args(["system", "graph-status", "--project"])
+        .arg(&sys_dir)
+        .output()
+        .unwrap();
+    assert!(cli_sg.status.success(), "{}", String::from_utf8_lossy(&cli_sg.stderr));
 }
 
 #[test]
@@ -436,6 +639,10 @@ fn binary_mcp_refuses_plugin_cwd_under_ancestor_git() {
         (3, "system_init", json!({ "name": "Unsafe" })),
         (4, "orch_session_status", json!({})),
         (5, "orch_working_memory_read", json!({ "project": ".", "scope_id": "test" })),
+        (6, "omnigraph_status", json!({})),
+        (7, "omnigraph_publish", json!({ "title": "Unsafe" })),
+        (8, "system_graph_status", json!({ "project": "." })),
+        (9, "orch_permission_mode", json!({ "session_id": "s-1", "mode": "manual" })),
     ] {
         let resp = rpc(
             &mut stdin,
@@ -476,6 +683,7 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
         session_concurrency: 1,
         projects: vec![repo.clone()],
         providers: BTreeMap::new(),
+        path_env: std::env::var_os("PATH"),
     };
     let control = Arc::new(ServerControl {
         config: config.clone(),
@@ -568,9 +776,52 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
         r#"id="results-view""#,
         r#"id="systems-view""#,
         r#"id="system-changes-view""#,
+        r#"id="omnigraph-view""#,
     ] {
         assert!(main_slice.contains(inside_main), "{inside_main} escaped <main>");
     }
+    let wasm_bytes = client
+        .get(format!("{base}/assets/orch_ui_bg.wasm"))
+        .send()
+        .await
+        .unwrap()
+        .bytes()
+        .await
+        .unwrap();
+    assert_eq!(&wasm_bytes[..4], b"\0asm");
+
+    let perms_wait = client
+        .get(format!("{base}/api/permissions/waiting"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(perms_wait.status(), 200);
+    let omni_http = client
+        .get(format!("{base}/api/omnigraph/status?project_id={project_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(omni_http.status(), 200);
+    let sg_missing = client
+        .get(format!("{base}/api/systems/graph/status?project_id={project_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sg_missing.status(), 404);
+    let sse = client
+        .get(format!("{base}/api/events/stream?project_id={project_id}"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(sse.status(), 200);
+    assert!(
+        sse.headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|ct| ct.contains("text/event-stream")),
+        "expected SSE content-type"
+    );
+    drop(sse);
     let css = client.get(format!("{base}/app.css")).send().await.unwrap().text().await.unwrap();
     assert!(css.contains("-webkit-appearance:none"));
     assert!(css.contains("text-overflow:ellipsis"));

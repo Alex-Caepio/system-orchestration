@@ -111,7 +111,7 @@ impl orch_system::SessionBridge for SystemBridge {
         self.links
             .runner()
             .map_err(core)?
-            .launch_internal(request, None, system, discovery)
+            .launch_internal(request, system, discovery)
             .map_err(core)
     }
     fn session(&self, id: &str) -> orch_core::Result<Value> {
@@ -141,6 +141,9 @@ impl orch_system::SessionBridge for SystemBridge {
             }
         }
         Ok(out)
+    }
+    fn waiting_permissions(&self, id: &str) -> orch_core::Result<Vec<Value>> {
+        Ok(self.links.runner().map_err(core)?.waiting_permissions(id))
     }
     fn find_launch(&self, run_id: &str, nonce: &str) -> orch_core::Result<Option<Value>> {
         let rows = {
@@ -206,7 +209,7 @@ pub struct SystemsDomain {
     pub manager: Arc<orch_system::SystemManager>,
     // One owned guard covers both submitted and running blocking work. The
     // flag closes admission after the last preceding operation has drained.
-    gate: Arc<tokio::sync::Mutex<bool>>,
+    pub(crate) gate: Arc<tokio::sync::Mutex<bool>>,
 }
 impl SystemsDomain {
     pub fn new(manager: Arc<orch_system::SystemManager>) -> Self {
@@ -274,6 +277,7 @@ pub struct SystemWorkflow {
     pub store: SessionStore,
     pub links: Arc<SessionLinks>,
     pub discovery: bool,
+    pub bridge: Option<Arc<crate::system_graph::HarnessCodeGraphBridge>>,
 }
 impl SpecialWorkflow for SystemWorkflow {
     fn run<'a>(
@@ -292,11 +296,12 @@ impl SpecialWorkflow for SystemWorkflow {
             }];
             let run = metadata["run_id"]
                 .as_str()
-                .ok_or_else(|| HarnessError::invalid("System run identity missing."))?;
+                .ok_or_else(|| HarnessError::invalid("System run identity missing."))?
+                .to_owned();
             let nonce = metadata["nonce"]
                 .as_str()
                 .ok_or_else(|| HarnessError::invalid("System nonce missing."))?;
-            if [run, nonce].iter().any(|s| {
+            if [run.as_str(), nonce].iter().any(|s| {
                 s.len() != 32
                     || !s
                         .bytes()
@@ -312,12 +317,13 @@ impl SpecialWorkflow for SystemWorkflow {
                 } else {
                     "ai-system"
                 })
-                .join(run);
+                .join(&run);
             let name = format!("request-{nonce}.json");
-            let mut files = orch_core::publication::PublicationFiles::new(&directory)?;
-            files
-                .read(&name, 16 * 1024 * 1024)?
-                .ok_or_else(|| HarnessError::missing("System run request disappeared."))?;
+            {
+                let path = directory.join(&name);
+                orch_core::fs::admit_descendant(&directory, &path)?;
+                orch_core::fs::read_regular(&path)?;
+            }
             let adapter: Arc<dyn orch_host::provider::LaunchAdapter> = if self.discovery {
                 Arc::new(crate::launch_adapter::EvidenceLaunchAdapter {
                     workspace: directory.join("agent"),
@@ -325,14 +331,28 @@ impl SpecialWorkflow for SystemWorkflow {
             } else {
                 self.links.runner()?.system_launch_adapter()?
             };
+            let sid = session["id"].as_str().unwrap_or("").to_owned();
+            let approvals = (!self.discovery)
+                .then(|| {
+                    self.links
+                        .runner()
+                        .ok()
+                        .and_then(|runner| runner.system_approvals(&sid, &session, &emit))
+                })
+                .flatten();
             let observer = Arc::new(WorkflowObserver {
                 store: self.store.clone(),
-                sid: session["id"].as_str().unwrap_or("").into(),
-                generation,
+                sid: sid.clone(),
+                generation: generation.clone(),
                 cancel: cancel.clone(),
             });
             let lock = Some(self.store.runner_lock());
             let display = emit.clone();
+            let activity_store = self.store.clone();
+            let activity_sid = sid.clone();
+            let activity_gen = generation.clone();
+            let activity_bridge = (!self.discovery).then(|| self.bridge.clone()).flatten();
+            let activity_run = run.clone();
             let mut activity: Option<crate::agent_activity::ActivityStream> = None;
             let agent =
                 move |signal: orch_system::workers::AgentSignal| -> orch_core::Result<()> {
@@ -351,13 +371,43 @@ impl SpecialWorkflow for SystemWorkflow {
                                 .into_iter()
                                 .map(|(path, value)| (path.to_string_lossy().into_owned(), value))
                                 .collect();
-                            let display = display.clone();
-                            activity = Some(crate::agent_activity::ActivityStream::new(
-                                move |event| display(event),
-                                &provider,
-                                roots,
-                                aliases,
-                            ));
+                            if let Some(bridge) = activity_bridge.clone() {
+                                let store = activity_store.clone();
+                                let sid = activity_sid.clone();
+                                let generation = activity_gen.clone();
+                                let run_id = activity_run.clone();
+                                activity =
+                                    Some(crate::agent_activity::ActivityStream::new_with_ids(
+                                        move |event| {
+                                            let Some(id) = store.guarded_event_id(
+                                                &sid,
+                                                &generation,
+                                                &event,
+                                            )?
+                                            else {
+                                                return Err(HarnessError::conflict(
+                                                    "The session generation changed.",
+                                                ));
+                                            };
+                                            Ok(Some(id))
+                                        },
+                                        move |event_id, event| {
+                                            bridge
+                                                .on_emitted_session_event(&run_id, event_id, event);
+                                        },
+                                        &provider,
+                                        roots,
+                                        aliases,
+                                    ));
+                            } else {
+                                let display = display.clone();
+                                activity = Some(crate::agent_activity::ActivityStream::new(
+                                    move |event| display(event),
+                                    &provider,
+                                    roots,
+                                    aliases,
+                                ));
+                            }
                         }
                         AgentSignal::Started {
                             agent,
@@ -393,13 +443,42 @@ impl SpecialWorkflow for SystemWorkflow {
                     agent,
                 )
                 .await?
-            } else {
-                orch_system::workers::run_system_request_with_adapter(
+            } else if let Some(bridge) = &self.bridge {
+                struct SessionGuard<'a> {
+                    bridge: &'a crate::system_graph::HarnessCodeGraphBridge,
+                    run_id: String,
+                }
+                impl Drop for SessionGuard<'_> {
+                    fn drop(&mut self) {
+                        self.bridge.unregister_session(&self.run_id);
+                    }
+                }
+                bridge.register_session(&run, &sid, &generation);
+                let _session_guard = SessionGuard {
+                    bridge,
+                    run_id: run.clone(),
+                };
+                orch_system::workers::run_system_request_with_bridge_and_approvals(
                     &directory.join(name),
                     cancel,
                     lock,
                     adapter,
                     observer,
+                    bridge.clone(),
+                    Some(sid),
+                    approvals,
+                    move |event| emit(event).map_err(core),
+                    agent,
+                )
+                .await?
+            } else {
+                orch_system::workers::run_system_request_with_adapter_and_approvals(
+                    &directory.join(name),
+                    cancel,
+                    lock,
+                    adapter,
+                    observer,
+                    approvals,
                     move |event| emit(event).map_err(core),
                     agent,
                 )

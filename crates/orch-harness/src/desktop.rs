@@ -15,6 +15,7 @@ pub struct ServerConfig {
     pub session_concurrency: usize,
     pub projects: Vec<PathBuf>,
     pub providers: BTreeMap<String, String>,
+    pub path_env: Option<std::ffi::OsString>,
 }
 
 pub type FactoryFuture<'a> =

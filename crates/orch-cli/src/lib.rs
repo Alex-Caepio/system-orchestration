@@ -23,8 +23,9 @@ fn usage() -> &'static str {
         env!("CARGO_PKG_VERSION"),
         " — Standalone multi-service orchestration, session scheduler, working memory, & workbench\n\n",
         "USAGE:\n",
-        "  orch-engine system <init|catalog|validate|map|locate|plan|verify|execute|resume|run-status|diagram> [OPTIONS]\n",
-        "  orch-engine session <start|send|status|list|cancel|context-draft> [OPTIONS]\n",
+        "  orch-engine system <init|catalog|validate|map|locate|plan|verify|execute|resume|run-status|diagram|graph-status> [OPTIONS]\n",
+        "  orch-engine session <start|send|status|list|cancel|context-draft|permission> [OPTIONS]\n",
+        "  orch-engine omnigraph <status|atoms|publish|branch-diff|merge-keep> [OPTIONS]\n",
         "  orch-engine fleet <run|resume> [OPTIONS]\n",
         "  orch-engine serve [serve|start] [OPTIONS]\n",
         "  orch-engine attach [--project PATH] [--provider claude|codex|cursor] [--state-dir PATH] [--overlay-dir PATH] [-- ARGS...]\n",
@@ -85,6 +86,7 @@ async fn open_services(state: &Path, project: &Path) -> Result<Arc<dyn Services>
         session_concurrency: 2,
         projects: vec![project.to_path_buf()],
         providers: BTreeMap::new(),
+        path_env: std::env::var_os("PATH"),
     };
     let control = Arc::new(ServerControl {
         config: config.clone(),
@@ -111,13 +113,13 @@ fn print_payload(payload: Payload) -> Result<i32> {
 async fn run_session_cli(args: &[String]) -> Result<i32> {
     let Some(sub) = args.first().map(String::as_str) else {
         println!(
-            "Usage: orch-engine session <start|send|status|list|cancel|context-draft> [OPTIONS]"
+            "Usage: orch-engine session <start|send|status|list|cancel|context-draft|permission> [OPTIONS]"
         );
         return Ok(0);
     };
     if matches!(sub, "-h" | "--help") {
         println!(
-            "Usage: orch-engine session <start|send|status|list|cancel|context-draft> [--project PATH] [--state-dir PATH] ..."
+            "Usage: orch-engine session <start|send|status|list|cancel|context-draft|permission> [--project PATH] [--state-dir PATH] ..."
         );
         return Ok(0);
     }
@@ -217,6 +219,9 @@ async fn run_session_cli(args: &[String]) -> Result<i32> {
                 "workspace": "project",
                 "prompt": prompt
             });
+            if let Some(perms) = take_opt(rest, "permissions")? {
+                body["permissions"] = json!(perms);
+            }
             if workflow == "fleet-review" && has_flag(rest, "dry-run") {
                 body["fleet"] = json!({ "dry_run": true });
             }
@@ -233,17 +238,81 @@ async fn run_session_cli(args: &[String]) -> Result<i32> {
                 .ok_or_else(|| RuntimeError::invalid("Missing --id <SESSION_ID>"))?;
             let prompt = take_opt(rest, "prompt")?
                 .ok_or_else(|| RuntimeError::invalid("Missing --prompt <TEXT>"))?;
+            let mut body = json!({ "prompt": prompt });
+            if let Some(perms) = take_opt(rest, "permissions")? {
+                body["permissions"] = json!(perms);
+            }
             services
                 .request(
                     "sessions.send",
                     json!({
                         "params": { "session_id": sid },
                         "query": {},
-                        "body": { "prompt": prompt }
+                        "body": body
                     }),
                 )
                 .await
                 .map_err(|e| RuntimeError::invalid(e.message))
+        }
+        "permission" => {
+            let sid = take_opt(rest, "id")?
+                .ok_or_else(|| RuntimeError::invalid("Missing --id <SESSION_ID>"))?;
+            if let Some(req_id) = take_opt(rest, "request-id")? {
+                let decision = take_opt(rest, "decision")?
+                    .ok_or_else(|| RuntimeError::invalid("Missing --decision <allow|allow_session|deny>"))?;
+                services
+                    .request(
+                        "sessions.permission",
+                        json!({
+                            "params": { "session_id": sid, "request_id": req_id },
+                            "query": {},
+                            "body": { "decision": decision }
+                        }),
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::invalid(e.message))
+            } else if has_flag(rest, "revoke-all")
+                || take_opt(rest, "revoke-id")?.is_some()
+                || take_opt(rest, "revoke-key")?.is_some()
+            {
+                let mut body = serde_json::Map::new();
+                if has_flag(rest, "revoke-all") {
+                    body.insert("all".into(), json!(true));
+                }
+                if let Some(id) = take_opt(rest, "revoke-id")? {
+                    body.insert("id".into(), json!(id));
+                }
+                if let Some(rk) = take_opt(rest, "revoke-key")? {
+                    body.insert("rule_key".into(), json!(rk));
+                }
+                services
+                    .request(
+                        "sessions.permission_rules_delete",
+                        json!({
+                            "params": { "session_id": sid },
+                            "query": {},
+                            "body": serde_json::Value::Object(body)
+                        }),
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::invalid(e.message))
+            } else {
+                let mut body = serde_json::Map::new();
+                if let Some(mode) = take_opt(rest, "mode")? {
+                    body.insert("mode".into(), json!(mode));
+                }
+                services
+                    .request(
+                        "sessions.permission_mode",
+                        json!({
+                            "params": { "session_id": sid },
+                            "query": {},
+                            "body": serde_json::Value::Object(body)
+                        }),
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::invalid(e.message))
+            }
         }
         other => Err(RuntimeError::invalid(format!(
             "Unknown session subcommand `{other}`"
@@ -337,6 +406,225 @@ fn run_hook_cli(args: &[String]) -> Result<i32> {
     Ok(outcome.code)
 }
 
+async fn ensure_registered_project(services: &Arc<dyn Services>, project: &Path) -> Result<String> {
+    let added = services
+        .request(
+            "projects.add",
+            json!({ "params": {}, "query": {}, "body": { "path": project.to_string_lossy() } }),
+        )
+        .await
+        .map_err(|e| RuntimeError::invalid(e.message))?;
+    match added {
+        Payload::Json(v) => v["project"]["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| RuntimeError::unavailable("Registered project returned empty id")),
+        Payload::Bytes { .. } => Err(RuntimeError::unavailable("Unexpected binary payload for projects.add")),
+    }
+}
+
+async fn run_system_graph_status_cli(args: &[String]) -> Result<i32> {
+    if args.iter().any(|a| matches!(a.as_str(), "-h" | "--help")) {
+        println!("Usage: orch-engine system graph-status [--project PATH] [--state-dir PATH] [--config PATH] [--service ID] [--check]");
+        return Ok(0);
+    }
+    let project = match take_opt(args, "project")? {
+        Some(raw) => orch_core::fs::canonicalize(Path::new(&raw))?,
+        None => orch_core::fs::canonicalize(&std::env::current_dir()?)?,
+    };
+    let state = resolve_state(take_opt(args, "state-dir")?, Some(&project))?;
+    let services = open_services(&state, &project).await?;
+    let pid = ensure_registered_project(&services, &project).await?;
+    let mut query = serde_json::Map::new();
+    query.insert("project_id".into(), json!(pid));
+    if let Some(cfg) = take_opt(args, "config")?.or(take_opt(args, "system")?) {
+        query.insert("config_path".into(), json!(cfg));
+    }
+    if has_flag(args, "check") {
+        query.insert("check".into(), json!("1"));
+    }
+    if let Some(svc) = take_opt(args, "service")? {
+        query.insert("service".into(), json!(svc));
+    }
+    let res = services
+        .request(
+            "system_graph.status",
+            json!({ "params": {}, "query": serde_json::Value::Object(query), "body": {} }),
+        )
+        .await
+        .map_err(|e| RuntimeError::invalid(e.message));
+    let code = match res {
+        Ok(p) => print_payload(p),
+        Err(e) => {
+            let _ = services.close().await;
+            return Err(e);
+        }
+    };
+    let _ = services.close().await;
+    code
+}
+
+async fn run_omnigraph_cli(args: &[String]) -> Result<i32> {
+    let Some(sub) = args.first().map(String::as_str) else {
+        println!(
+            "Usage: orch-engine omnigraph <status|atoms|publish|branch-diff|merge-keep> [--project PATH] [--state-dir PATH] ..."
+        );
+        return Ok(0);
+    };
+    if matches!(sub, "-h" | "--help") {
+        println!(
+            "Usage: orch-engine omnigraph <status|atoms|publish|branch-diff|merge-keep> [--project PATH] [--state-dir PATH] ..."
+        );
+        return Ok(0);
+    }
+    let rest = &args[1..];
+    let project = match take_opt(rest, "project")? {
+        Some(raw) => orch_core::fs::canonicalize(Path::new(&raw))?,
+        None => orch_core::fs::canonicalize(&std::env::current_dir()?)?,
+    };
+    let state = resolve_state(take_opt(rest, "state-dir")?, Some(&project))?;
+    let services = open_services(&state, &project).await?;
+    let pid = ensure_registered_project(&services, &project).await?;
+    let res = match sub {
+        "status" => services
+            .request(
+                "omnigraph.status",
+                json!({ "params": {}, "query": { "project_id": pid }, "body": {} }),
+            )
+            .await
+            .map_err(|e| RuntimeError::invalid(e.message)),
+        "atoms" => {
+            let mut query = serde_json::Map::new();
+            query.insert("project_id".into(), json!(pid));
+            for (flag, key) in [
+                ("branch", "branch"),
+                ("snapshot", "snapshot"),
+                ("kind", "kind"),
+                ("q", "q"),
+                ("query", "q"),
+                ("session-id", "session_id"),
+                ("limit", "limit"),
+                ("offset", "offset"),
+                ("cursor", "cursor"),
+            ] {
+                if let Some(val) = take_opt(rest, flag)? {
+                    query.insert(key.into(), json!(val));
+                }
+            }
+            let op = if has_flag(rest, "search") {
+                "omnigraph.search"
+            } else {
+                "omnigraph.graph"
+            };
+            services
+                .request(
+                    op,
+                    json!({ "params": {}, "query": serde_json::Value::Object(query), "body": {} }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))
+        }
+        "publish" => {
+            let title = take_opt(rest, "title")?
+                .ok_or_else(|| RuntimeError::invalid("Missing --title <TEXT>"))?;
+            let mut body = json!({
+                "project_id": pid,
+                "title": title,
+            });
+            for (flag, key) in [
+                ("kind", "kind"),
+                ("summary", "summary"),
+                ("body", "body"),
+                ("branch", "branch"),
+                ("atom-id", "atom_id"),
+                ("session-id", "session_id"),
+            ] {
+                if let Some(val) = take_opt(rest, flag)? {
+                    body[key] = json!(val);
+                }
+            }
+            if let Some(files_raw) = take_opt(rest, "files")? {
+                let list: Vec<String> = files_raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                body["files"] = json!(list);
+            }
+            if let Some(tags_raw) = take_opt(rest, "tags")? {
+                let list: Vec<String> = tags_raw
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .collect();
+                body["tags"] = json!(list);
+            }
+            services
+                .request(
+                    "omnigraph.publish",
+                    json!({ "params": {}, "query": {}, "body": body }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))
+        }
+        "branch-diff" => {
+            let source = take_opt(rest, "source")?
+                .ok_or_else(|| RuntimeError::invalid("Missing --source <BRANCH>"))?;
+            let target = take_opt(rest, "target")?.unwrap_or_else(|| "main".into());
+            services
+                .request(
+                    "omnigraph.branch_diff",
+                    json!({
+                        "params": {},
+                        "query": { "project_id": pid, "source": source, "target": target },
+                        "body": {}
+                    }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))
+        }
+        "merge-keep" => {
+            let atom_id = take_opt(rest, "atom-id")?
+                .ok_or_else(|| RuntimeError::invalid("Missing --atom-id <ID>"))?;
+            let from = take_opt(rest, "from")?
+                .ok_or_else(|| RuntimeError::invalid("Missing --from <BRANCH>"))?;
+            let to = take_opt(rest, "to")?.unwrap_or_else(|| "main".into());
+            services
+                .request(
+                    "omnigraph.branch_act",
+                    json!({
+                        "params": {},
+                        "query": {},
+                        "body": {
+                            "action": "keep",
+                            "project_id": pid,
+                            "atom_id": atom_id,
+                            "from": from,
+                            "to": to
+                        }
+                    }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))
+        }
+        other => Err(RuntimeError::invalid(format!(
+            "Unknown omnigraph subcommand `{other}`"
+        ))),
+    };
+    let code = match res {
+        Ok(p) => print_payload(p),
+        Err(e) => {
+            let _ = services.close().await;
+            return Err(e);
+        }
+    };
+    let _ = services.close().await;
+    code
+}
+
 pub async fn dispatch(args: &[String]) -> Result<i32> {
     let Some(first) = args.first().map(String::as_str) else {
         print!("{}", usage());
@@ -355,7 +643,14 @@ pub async fn dispatch(args: &[String]) -> Result<i32> {
         "internal-guard" | "internal-sandbox-child" | "internal-discovery-probe" => {
             orch_harness::run(first, rest).await
         }
-        "system" => orch_harness::run("system", rest).await,
+        "system" => {
+            if rest.first().map(String::as_str) == Some("graph-status") {
+                run_system_graph_status_cli(&rest[1..]).await
+            } else {
+                orch_harness::run("system", rest).await
+            }
+        }
+        "omnigraph" => run_omnigraph_cli(rest).await,
         "fleet" | "harness" => orch_harness::run("fleet", rest).await,
         "serve" => orch_harness::facade::run_with_assets("serve", rest, assets::embedded_assets()).await,
         "session" => run_session_cli(rest).await,

@@ -15,6 +15,7 @@ const SPECIAL: &[&str] = &[
     "creator",
     "system_run",
     "system_discovery",
+    "system_explain",
 ];
 const FROZEN: &[&str] = &[
     "id",
@@ -35,6 +36,7 @@ const FROZEN: &[&str] = &[
     "project_context",
     "budgets",
     "budget_revision",
+    "permissions",
 ];
 
 pub(crate) fn initialize(db: &Connection) -> Result<()> {
@@ -85,30 +87,68 @@ pub(crate) fn cancel_session(db: &Connection, sid: &str) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn authority(session: &Value) -> Result<Value> {
-    if session["workflow"] != "native"
-        || session["agents_enabled"] != false
-        || SPECIAL.iter().any(|key| !session[*key].is_null())
-        || !["claude", "codex", "cursor"].contains(&session["provider"].as_str().unwrap_or(""))
+/// Why a session cannot take an inbox follow-up, as a code: the checks
+/// `authority` makes, each named.
+fn eligibility(session: &Value) -> std::result::Result<(), &'static str> {
+    if session["workflow"] != "native" {
+        return Err("non_native_workflow");
+    }
+    if session["agents_enabled"] != false {
+        return Err("agents_enabled");
+    }
+    if !session["brain"].is_null() {
+        return Err("brain_linked");
+    }
+    if SPECIAL.iter().any(|key| !session[*key].is_null()) {
+        return Err("specialized_workflow");
+    }
+    if !["claude", "codex", "cursor"].contains(&session["provider"].as_str().unwrap_or(""))
         || !["plan", "edit"].contains(&session["mode"].as_str().unwrap_or(""))
-        || session["native_session_id"].as_str().is_none_or(|id| {
-            id.trim().is_empty()
-                || id.len() > 4096
-                || id.starts_with('-')
-                || id.chars().any(char::is_control)
-        })
     {
-        return Err(HarnessError::conflict(
-            "Inbox follow-ups require an ordinary native session without additional agents or specialized workflows and a known native session identity.",
-        ));
+        return Err("unsupported_provider_or_mode");
+    }
+    if session["native_session_id"].as_str().is_none_or(|id| {
+        id.trim().is_empty()
+            || id.len() > 4096
+            || id.starts_with('-')
+            || id.chars().any(char::is_control)
+    }) {
+        return Err("missing_native_session_id");
     }
     for key in ["id", "project_id", "project_path"] {
         if session[key]
             .as_str()
             .is_none_or(|value| value.trim().is_empty() || value.contains('\0'))
         {
+            return Err("missing_binding");
+        }
+    }
+    Ok(())
+}
+
+/// Whether a running session's live turn can take an inbox follow-up now,
+/// or the code of the reason it cannot.
+pub(crate) fn live_eligibility_reason(session: &Value) -> std::result::Result<(), &'static str> {
+    if session["status"] != "running" {
+        return Err("not_running");
+    }
+    if session["permissions"] == "manual" {
+        return Err("manual_permissions");
+    }
+    eligibility(session)
+}
+
+pub(crate) fn authority(session: &Value) -> Result<Value> {
+    match eligibility(session) {
+        Ok(()) => {}
+        Err("missing_binding") => {
             return Err(HarnessError::conflict(
                 "The session binding is unavailable.",
+            ));
+        }
+        Err(_) => {
+            return Err(HarnessError::conflict(
+                "Inbox follow-ups require an ordinary native session without additional agents or specialized workflows and a known native session identity.",
             ));
         }
     }
@@ -592,6 +632,69 @@ mod tests {
         let frozen = authority(&store.get("s").unwrap()).unwrap();
         (directory, store, frozen)
     }
+    #[test]
+    fn live_eligibility_reason_distinguishes_brain_linked_and_missing_native_id() {
+        let (_directory, store, _) = fixture();
+        let session = store.get("s").unwrap();
+        assert_eq!(live_eligibility_reason(&session), Ok(()));
+        let changed = |key: &str, value: Value| {
+            let mut changed = session.clone();
+            changed[key] = value;
+            live_eligibility_reason(&changed)
+        };
+        assert_eq!(changed("status", json!("completed")), Err("not_running"));
+        assert_eq!(
+            changed("workflow", json!("plan")),
+            Err("non_native_workflow")
+        );
+        assert_eq!(
+            changed("agents_enabled", json!(true)),
+            Err("agents_enabled")
+        );
+        assert_eq!(
+            changed("brain", json!({"task_id": "TASK-1"})),
+            Err("brain_linked")
+        );
+        for special in ["sdd", "fleet", "clash", "system_explain"] {
+            assert_eq!(
+                changed(special, json!({"x": 1})),
+                Err("specialized_workflow"),
+                "{special}"
+            );
+        }
+        assert_eq!(
+            changed("provider", json!("gemini")),
+            Err("unsupported_provider_or_mode")
+        );
+        assert_eq!(
+            changed("permissions", json!("manual")),
+            Err("manual_permissions")
+        );
+        // Idle manual sessions still report not_running rather than manual_permissions.
+        let mut idle_manual = session.clone();
+        idle_manual["status"] = json!("completed");
+        idle_manual["permissions"] = json!("manual");
+        assert_eq!(live_eligibility_reason(&idle_manual), Err("not_running"));
+        // Explicit user inbox authority still admits manual sessions and freezes permissions.
+        let mut live_manual = session.clone();
+        live_manual["permissions"] = json!("manual");
+        assert_eq!(authority(&live_manual).unwrap()["permissions"], "manual");
+        assert_eq!(
+            changed("native_session_id", Value::Null),
+            Err("missing_native_session_id")
+        );
+        assert_eq!(changed("project_path", json!("")), Err("missing_binding"));
+        // The inbox refuses the same sessions, with its own messages.
+        let mut explained = session.clone();
+        explained["system_explain"] = json!({"question": "why"});
+        assert!(authority(&explained).is_err());
+        let mut unbound = session.clone();
+        unbound["project_path"] = json!("");
+        assert_eq!(
+            authority(&unbound).unwrap_err().message,
+            "The session binding is unavailable."
+        );
+    }
     fn accept(store: &SessionStore, frozen: &Value, id: &str) -> Value {
         store
             .inbox_accept(
@@ -841,11 +944,11 @@ mod tests {
 
     #[test]
     fn changed_scope_or_binding_blocks_instead_of_assigning() {
-        for changed_scope in [false, true] {
+        for changed_field in ["scope", "model", "permissions"] {
             let (_dir, store, frozen) = fixture();
             accept(&store, &frozen, "request");
             source_completed(&store);
-            if !changed_scope {
+            if changed_field == "model" {
                 store
                     .connection()
                     .unwrap()
@@ -854,13 +957,23 @@ mod tests {
                         [],
                     )
                     .unwrap();
+            } else if changed_field == "permissions" {
+                store
+                    .connection()
+                    .unwrap()
+                    .execute("UPDATE sessions SET permissions='manual' WHERE id='s'", [])
+                    .unwrap();
             }
             assert!(
                 store
                     .inbox_claim(
                         "s",
                         "request",
-                        if changed_scope { "scope-2" } else { "scope-1" },
+                        if changed_field == "scope" {
+                            "scope-2"
+                        } else {
+                            "scope-1"
+                        },
                         &frozen
                     )
                     .unwrap()

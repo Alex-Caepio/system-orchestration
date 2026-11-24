@@ -6,8 +6,8 @@ use std::collections::BTreeSet;
 
 pub use privacy::{
     guard_shared_text, indexed_secret_policy_reason, mask_secrets, policy_pattern_matches,
-    sanitize_automatic_query, secret_label, secret_policy_fingerprint, sensitive_label,
-    source_path_problem,
+    sanitize_automatic_query, screen_rendered_text, secret_label, secret_policy_fingerprint,
+    sensitive_label, source_path_problem,
 };
 
 pub fn utc_now() -> String {

@@ -1,23 +1,143 @@
 use serde_json::Value as V;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::spawn_local;
-
 mod activity;
 mod api;
 mod classify;
+mod commands;
 mod dom;
+mod graph;
+mod graph_explanation;
+mod graph_map;
+pub(crate) mod graph_viewport;
 mod inbox;
 mod management;
 mod model;
+mod omnigraph;
+pub(crate) mod omnigraph_canvas;
 mod run;
 mod session;
+mod system_map;
 mod systems;
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    /// Rendered markup takes its colors from `app.css` tokens: a `#` followed
+    /// by a hex digit is an inline color unless it is an HTML entity (`&#39;`)
+    /// or an SVG fragment reference (`url(#…)`).
+    pub(crate) fn assert_no_inline_hex_colors(markup: &str) {
+        let bytes = markup.as_bytes();
+        for (idx, &b) in bytes.iter().enumerate() {
+            if b == b'#' {
+                let prev = idx.checked_sub(1).and_then(|p| bytes.get(p)).copied();
+                let next = bytes.get(idx + 1).copied();
+                let is_entity = prev == Some(b'&');
+                let is_url_ref = idx >= 4 && &bytes[idx - 4..idx] == b"url(";
+                if !is_entity && !is_url_ref && next.is_some_and(|c| c.is_ascii_hexdigit()) {
+                    panic!(
+                        "unexpected inline hex color in markup around byte {idx}: {}",
+                        &markup[idx..markup.len().min(idx + 16)]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The JSON payload of every element with `data-action="{action}"`, in
+    /// document order, decoded from its escaped `data-payload` attribute.
+    pub(crate) fn payloads(markup: &str, action: &str) -> Vec<serde_json::Value> {
+        let marker = format!("data-action=\"{action}\"");
+        markup
+            .match_indices(&marker)
+            .map(|(at, _)| {
+                let rest = &markup[at..];
+                let tag = &rest[..rest.find('>').expect("closed tag")];
+                let start = tag.find("data-payload=\"").expect("payload") + 14;
+                let raw = &tag[start..start + tag[start..].find('"').expect("quoted")];
+                let text = raw
+                    .replace("&quot;", "\"")
+                    .replace("&#39;", "'")
+                    .replace("&lt;", "<")
+                    .replace("&gt;", ">")
+                    .replace("&amp;", "&");
+                serde_json::from_str(&text).expect("JSON payload")
+            })
+            .collect()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TopDialogEscapeAction<'a> {
+    CloseCommandPalette,
+    CloseApprovalsDrawer,
+    CloseFileCard,
+    CloseGraphExplanation,
+    CloseDialog(&'a str),
+    DelegateToHandlers,
+}
+
+pub(crate) fn escape_action_for_top_dialog(top_dialog: Option<&str>) -> TopDialogEscapeAction<'_> {
+    match top_dialog {
+        Some("command-palette") => TopDialogEscapeAction::CloseCommandPalette,
+        Some("approvals-drawer") => TopDialogEscapeAction::CloseApprovalsDrawer,
+        Some("run-file-card") => TopDialogEscapeAction::CloseFileCard,
+        Some("graph-explanation") => TopDialogEscapeAction::CloseGraphExplanation,
+        Some(id) => TopDialogEscapeAction::CloseDialog(id),
+        None => TopDialogEscapeAction::DelegateToHandlers,
+    }
+}
+
+fn close_graph_explanation_cleanly() {
+    if let Some(close_btn) = dom::get("graph-explanation-close") {
+        if graph_explanation::click(&close_btn) {
+            return;
+        }
+    }
+    let fallback = dom::el("button", "", "");
+    let _ = fallback.set_attribute("id", "graph-explanation-close");
+    if !graph_explanation::click(&fallback) {
+        dom::dialog("graph-explanation", false);
+    }
+}
+
+fn close_top_dialog_action(
+    action: TopDialogEscapeAction<'_>,
+    key: &web_sys::KeyboardEvent,
+) -> bool {
+    match action {
+        TopDialogEscapeAction::CloseCommandPalette => {
+            commands::close_palette();
+            true
+        }
+        TopDialogEscapeAction::CloseApprovalsDrawer => {
+            run::close_approvals_drawer();
+            true
+        }
+        TopDialogEscapeAction::CloseFileCard => {
+            run::dismiss_file_card(true);
+            activity::dismiss_file_card(true);
+            true
+        }
+        TopDialogEscapeAction::CloseGraphExplanation => {
+            if !graph_explanation::key(key) {
+                close_graph_explanation_cleanly();
+            }
+            true
+        }
+        TopDialogEscapeAction::CloseDialog(id) => {
+            dom::dialog(id, false);
+            true
+        }
+        TopDialogEscapeAction::DelegateToHandlers => false,
+    }
+}
 
 #[wasm_bindgen(start)]
 pub fn start() -> Result<(), JsValue> {
     for kind in [
         "click",
+        "contextmenu",
         "change",
         "input",
         "submit",
@@ -28,8 +148,8 @@ pub fn start() -> Result<(), JsValue> {
         "pointercancel",
         "dblclick",
         "keyup",
-        "pointerover",
         "focusin",
+        "focusout",
     ] {
         let k = kind.to_owned();
         let callback = Closure::<dyn FnMut(web_sys::Event)>::new(move |event: web_sys::Event| {
@@ -39,7 +159,85 @@ pub fn start() -> Result<(), JsValue> {
             else {
                 return;
             };
+            if k == "contextmenu" {
+                if let Some(mouse) = event.dyn_ref::<web_sys::MouseEvent>() {
+                    if graph_explanation::context_menu(&target, mouse) {
+                        event.prevent_default();
+                    }
+                }
+                return;
+            }
+            if k == "click" {
+                dom::sync_widget_from_target(&target);
+                if let Ok(Some(copy_btn)) = target.closest("[data-action=\"copy-code\"]") {
+                    event.prevent_default();
+                    spawn_local(async move {
+                        run::copy_code_block(&copy_btn).await;
+                    });
+                    return;
+                }
+                if let Ok(Some(diff_btn)) = target
+                    .closest("[data-action=\"diff-copy-path\"],[data-action=\"diff-copy-hunk\"]")
+                {
+                    event.prevent_default();
+                    let action = diff_btn.get_attribute("data-action").unwrap_or_default();
+                    spawn_local(async move {
+                        if action == "diff-copy-path" {
+                            run::copy_diff_path_button(&diff_btn).await;
+                        } else {
+                            run::copy_diff_hunk_button(&diff_btn).await;
+                        }
+                    });
+                    return;
+                }
+                if graph_explanation::click(&target) {
+                    return;
+                }
+            }
+            // The keys held with a click, for what reads them: Alt on a
+            // kind of link shows that kind alone.
+            if k == "click" {
+                if let Some(mouse) = event.dyn_ref::<web_sys::MouseEvent>() {
+                    model::set(
+                        "pointer-mods",
+                        serde_json::json!({
+                            "alt": mouse.alt_key(),
+                            "shift": mouse.shift_key(),
+                            "ctrl": mouse.ctrl_key() || mouse.meta_key(),
+                        }),
+                    );
+                }
+            }
             if k == "keyup" {
+                if target.id() == "prompt" {
+                    if let Some(key_event) = event.dyn_ref::<web_sys::KeyboardEvent>() {
+                        if matches!(
+                            key_event.key().as_str(),
+                            "ArrowLeft" | "ArrowRight" | "Home" | "End" | "PageUp" | "PageDown"
+                        ) {
+                            spawn_local(async {
+                                commands::update().await;
+                            });
+                        }
+                    }
+                }
+                return;
+            }
+            if k == "focusin" {
+                dom::sync_widget_from_target(&target);
+                commands::handle_focus_in(&target);
+                run::sync_permission_rules_for_focus(&target);
+                return;
+            }
+            if k == "focusout" {
+                if target.id() == "prompt"
+                    || target.closest("#session-form").ok().flatten().is_some()
+                {
+                    session::flush_preferences();
+                }
+                if let Some(focus_event) = event.dyn_ref::<web_sys::FocusEvent>() {
+                    commands::handle_focus_out(&target, focus_event);
+                }
                 return;
             }
             if k == "keydown" {
@@ -56,14 +254,49 @@ pub fn start() -> Result<(), JsValue> {
                     });
                     return;
                 }
-                if key.key() == "Escape" {
-                    dom::class("sidebar", "open", false);
-                    dom::class("scrim", "open", false);
-                    dom::attr("menu-toggle", "aria-expanded", "false");
-                    dom::dialog("folder-picker", false);
-                    dom::dialog("merge-picker", false);
+                if commands::palette_key(key) || run::handle_permission_shortcut(key) {
+                    event.prevent_default();
+                    return;
+                }
+                let is_escape = key.key() == "Escape";
+                let top_dialog = if is_escape {
+                    dom::top_open_dialog_id()
+                } else {
+                    None
+                };
+                if is_escape
+                    && close_top_dialog_action(
+                        escape_action_for_top_dialog(top_dialog.as_deref()),
+                        key,
+                    )
+                {
+                    event.prevent_default();
+                    return;
+                }
+                if graph_explanation::key(key)
+                    || commands::key(key)
+                    || graph_map::key(key)
+                    || system_map::key(key)
+                    || omnigraph::key(key)
+                {
+                    event.prevent_default();
+                    return;
+                }
+                if is_escape {
+                    if run::escape()
+                        || activity::escape()
+                        || dom::collapse_active_expanded_workspace()
+                    {
+                        event.prevent_default();
+                        return;
+                    }
+                    session::set_sidebar_open(false, true);
                 }
                 session::resize_key(key);
+                session::workspace_split_key(key);
+                if dom::handle_a11y_keydown(key) {
+                    event.prevent_default();
+                }
                 return;
             }
             if [
@@ -75,7 +308,18 @@ pub fn start() -> Result<(), JsValue> {
             ]
             .contains(&k.as_str())
             {
-                session::resize_event(&k, &event);
+                if k == "pointerdown" {
+                    commands::handle_pointer_down(&target);
+                    run::pointer_down(&target);
+                    activity::pointer_down(&target);
+                }
+                if !graph_map::pointer_event(&k, &event)
+                    && !system_map::pointer_event(&k, &event)
+                    && !omnigraph::pointer_event(&k, &event)
+                {
+                    session::resize_event(&k, &event);
+                    session::workspace_split_event(&k, &event);
+                }
                 return;
             }
             if k == "submit" {
@@ -93,18 +337,6 @@ pub fn start() -> Result<(), JsValue> {
             if dom::is_disabled(&element) {
                 return;
             }
-            let id = element.id();
-            let action = element.get_attribute("data-action").unwrap_or_else(|| {
-                if id.is_empty() && element.get_attribute("name").as_deref() == Some("theme") {
-                    "theme".to_owned()
-                } else {
-                    id.clone()
-                }
-            });
-            let payload = element
-                .get_attribute("data-payload")
-                .and_then(|v| serde_json::from_str::<V>(&v).ok())
-                .unwrap_or(V::Null);
             if k == "click" && element.class_list().contains("explain") {
                 let expanded = element.get_attribute("aria-expanded").as_deref() == Some("true");
                 let next = if expanded { "false" } else { "true" };
@@ -114,6 +346,78 @@ pub fn start() -> Result<(), JsValue> {
                     dom::hidden(&target_id, false);
                 }
                 return;
+            }
+            if k == "click" && element.id() == "approvals-drawer" {
+                if let Some(mouse) = event.dyn_ref::<web_sys::MouseEvent>() {
+                    if dom::click_outside_element(&element, mouse) {
+                        run::close_approvals_drawer();
+                    }
+                }
+                return;
+            }
+            if k == "click" && element.id() == "run-file-card" {
+                if let Some(mouse) = event.dyn_ref::<web_sys::MouseEvent>() {
+                    if dom::click_outside_element(&element, mouse) {
+                        run::dismiss_file_card(false);
+                        activity::dismiss_file_card(false);
+                    }
+                }
+                return;
+            }
+            if k == "click"
+                && matches!(
+                    element.id().as_str(),
+                    "folder-picker"
+                        | "merge-picker"
+                        | "omni-settings-dialog"
+                        | "omnigraph-transfer-dialog"
+                        | "omnigraph-share-dialog"
+                )
+            {
+                if let Some(mouse) = event.dyn_ref::<web_sys::MouseEvent>() {
+                    if dom::click_outside_element(&element, mouse) {
+                        dom::dialog(&element.id(), false);
+                    }
+                }
+                return;
+            }
+            let id = element.id();
+            let action = element.get_attribute("data-action").unwrap_or_else(|| {
+                if id.is_empty() && element.get_attribute("name").as_deref() == Some("theme") {
+                    "theme".to_owned()
+                } else {
+                    id.clone()
+                }
+            });
+            let mut payload = element
+                .get_attribute("data-payload")
+                .and_then(|v| serde_json::from_str::<V>(&v).ok())
+                .unwrap_or(V::Null);
+            if payload.is_null() && action == "inspect-system-file-graph" {
+                let svc = element.get_attribute("data-service").unwrap_or_default();
+                let path = element.get_attribute("data-path").unwrap_or_default();
+                if !svc.is_empty() || !path.is_empty() {
+                    payload = serde_json::json!({ "service": svc, "path": path });
+                }
+            }
+            if payload.is_null() && action.starts_with("omnigraph-") {
+                let mut map = serde_json::Map::new();
+                for (key, attr) in [
+                    ("node_id", "data-node-id"),
+                    ("commit_id", "data-commit-id"),
+                    ("branch", "data-branch"),
+                    ("atom_id", "data-atom-id"),
+                    ("session_id", "data-session-id"),
+                    ("kind", "data-kind"),
+                    ("tab", "data-tab"),
+                ] {
+                    if let Some(val) = element.get_attribute(attr) {
+                        map.insert(key.into(), V::String(val));
+                    }
+                }
+                if !map.is_empty() {
+                    payload = V::Object(map);
+                }
             }
             if let Some(view) = element.get_attribute("data-view").or_else(|| {
                 element
@@ -135,6 +439,9 @@ pub fn start() -> Result<(), JsValue> {
             let value = dom::value_of(&element);
             let checked = dom::checked_of(&element);
             let kind = k.clone();
+            if system_map::event(&kind, &id, &action, &payload, &element) {
+                return;
+            }
             spawn_local(async move {
                 dispatch(&kind, &id, &action, payload, &field, value, checked).await;
             });
@@ -143,26 +450,105 @@ pub fn start() -> Result<(), JsValue> {
             .add_event_listener_with_callback(kind, callback.as_ref().unchecked_ref())?;
         callback.forget();
     }
+    graph_map::attach_wheel_listeners();
+    system_map::attach_wheel_listeners();
+    omnigraph::attach_wheel_listeners();
     let pop = Closure::<dyn FnMut(web_sys::Event)>::new(|_| {
         spawn_local(async {
-            let view = dom::hash_view();
-            session::open_view(&view, false).await;
+            session::apply_hash_route().await;
         })
     });
     dom::window().add_event_listener_with_callback("popstate", pop.as_ref().unchecked_ref())?;
     pop.forget();
-    let save = Closure::<dyn FnMut(web_sys::Event)>::new(|_| session::save_preferences());
+    let cancel_cb = Closure::<dyn FnMut(web_sys::Event)>::new(|event: web_sys::Event| {
+        let Some(target) = event
+            .target()
+            .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        match target.id().as_str() {
+            "command-palette" => {
+                event.prevent_default();
+                commands::close_palette();
+            }
+            "approvals-drawer" => {
+                event.prevent_default();
+                run::close_approvals_drawer();
+            }
+            "run-file-card" => {
+                event.prevent_default();
+                run::dismiss_file_card(true);
+                activity::dismiss_file_card(true);
+            }
+            "graph-explanation" => {
+                event.prevent_default();
+                close_graph_explanation_cleanly();
+            }
+            _ => {}
+        }
+    });
+    dom::document().add_event_listener_with_callback_and_bool(
+        "cancel",
+        cancel_cb.as_ref().unchecked_ref(),
+        true,
+    )?;
+    cancel_cb.forget();
+    let toggle_cb = Closure::<dyn FnMut(web_sys::Event)>::new(|event: web_sys::Event| {
+        if let Some(target) = event
+            .target()
+            .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+        {
+            dom::handle_a11y_toggle(&target);
+        }
+    });
+    dom::document().add_event_listener_with_callback_and_bool(
+        "toggle",
+        toggle_cb.as_ref().unchecked_ref(),
+        true,
+    )?;
+    toggle_cb.forget();
+    let close_cb = Closure::<dyn FnMut(web_sys::Event)>::new(|event: web_sys::Event| {
+        if let Some(target) = event
+            .target()
+            .and_then(|v| v.dyn_into::<web_sys::Element>().ok())
+        {
+            dom::handle_a11y_dialog_close(&target);
+        }
+    });
+    dom::document().add_event_listener_with_callback_and_bool(
+        "close",
+        close_cb.as_ref().unchecked_ref(),
+        true,
+    )?;
+    close_cb.forget();
+    if let Some(conv) = dom::get("conversation") {
+        let scroll_cb = Closure::<dyn FnMut(web_sys::Event)>::new(|_| {
+            run::on_conversation_scroll();
+        });
+        let _ = conv.add_event_listener_with_callback("scroll", scroll_cb.as_ref().unchecked_ref());
+        scroll_cb.forget();
+    }
+    let save = Closure::<dyn FnMut(web_sys::Event)>::new(|_| session::flush_preferences());
     dom::window().add_event_listener_with_callback("pagehide", save.as_ref().unchecked_ref())?;
     save.forget();
     let focus = Closure::<dyn FnMut(web_sys::Event)>::new(|_| {
         spawn_local(async {
             session::sign_in(true).await;
         });
+        // The server fetches again only once its last check is ten minutes old.
+        spawn_local(async {
+            session::update_status(true).await;
+        })
     });
     dom::window().add_event_listener_with_callback("focus", focus.as_ref().unchecked_ref())?;
     focus.forget();
     let visibility = Closure::<dyn FnMut(web_sys::Event)>::new(|_| {
+        if dom::document().hidden() {
+            session::flush_preferences();
+        }
         run::visibility();
+        omnigraph::visibility();
         if !dom::document().hidden() {
             spawn_local(async {
                 session::sign_in(true).await;
@@ -176,12 +562,14 @@ pub fn start() -> Result<(), JsValue> {
     visibility.forget();
     session::initialize();
     management::initialize();
+    systems::initialize();
+    activity::initialize();
+    omnigraph::initialize();
     spawn_local(async {
         session::bootstrap().await;
     });
     Ok(())
 }
-
 async fn dispatch(
     kind: &str,
     id: &str,
@@ -191,22 +579,47 @@ async fn dispatch(
     value: String,
     checked: bool,
 ) {
-    if kind == "click" && action.ends_with("-budgets-save") {
-        if let Some(prefix) = action.strip_suffix("-save") {
-            if !session::budget_fields_valid(prefix) {
-                dom::error(
-                    &format!("{prefix}-error"),
-                    "Use valid money, token and time limits.",
-                );
-                return;
-            }
+    let budget_prefix = if kind == "click" && action.ends_with("-budgets-save") {
+        action.strip_suffix("-save")
+    } else {
+        None
+    };
+    if let Some(prefix) = budget_prefix {
+        if !session::budget_fields_valid(prefix) {
+            dom::error(
+                &format!("{prefix}-error"),
+                "Use valid money, token and time limits.",
+            );
+            return;
         }
     }
     if !field.is_empty() && (kind == "input" || kind == "change") {
         systems::edit_field(field, &value, checked);
         return;
     }
+    if graph::event(kind, id, checked).await {
+        return;
+    }
+    if graph_map::event(kind, id, action, &payload, &value, checked).await {
+        return;
+    }
     if session::event(kind, id, action, &payload, &value, checked).await {
+        return;
+    }
+    if omnigraph::event(kind, id, action, &payload, &value, checked).await {
+        return;
+    }
+    if commands::event(kind, id, action, &payload, &value).await {
+        return;
+    }
+    if kind == "change"
+        && (action == "permission-rules-session" || id == "permission-rules-session")
+    {
+        run::select_permission_rules_session(&value).await;
+        return;
+    }
+    if kind == "click" && action == "permission-rules-revoke-all" {
+        run::revoke_active_permission_rules().await;
         return;
     }
     if run::event(kind, id, action, &payload, &value).await {
@@ -222,11 +635,34 @@ async fn dispatch(
 }
 
 #[cfg(test)]
-mod tests {
+mod escape_precedence_tests {
+    use super::*;
+
     #[test]
-    fn shell_command_classification_identifies_verification_commands() {
-        let out = crate::classify::classify("vendor/bin/phpunit");
-        assert_eq!(out["check"], true);
-        assert_eq!(out["fixer"], false);
+    fn top_modal_overlays_close_before_underlying_graph_handlers() {
+        assert_eq!(
+            escape_action_for_top_dialog(Some("approvals-drawer")),
+            TopDialogEscapeAction::CloseApprovalsDrawer
+        );
+        assert_eq!(
+            escape_action_for_top_dialog(Some("command-palette")),
+            TopDialogEscapeAction::CloseCommandPalette
+        );
+        assert_eq!(
+            escape_action_for_top_dialog(Some("run-file-card")),
+            TopDialogEscapeAction::CloseFileCard
+        );
+        assert_eq!(
+            escape_action_for_top_dialog(Some("graph-explanation")),
+            TopDialogEscapeAction::CloseGraphExplanation
+        );
+        assert_eq!(
+            escape_action_for_top_dialog(Some("folder-picker")),
+            TopDialogEscapeAction::CloseDialog("folder-picker")
+        );
+        assert_eq!(
+            escape_action_for_top_dialog(None),
+            TopDialogEscapeAction::DelegateToHandlers
+        );
     }
 }

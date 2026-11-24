@@ -42,6 +42,7 @@ impl RuntimeCache {
             session_concurrency: 2,
             projects: vec![project.to_path_buf()],
             providers: BTreeMap::new(),
+            path_env: std::env::var_os("PATH"),
         };
         let control = Arc::new(ServerControl {
             config: config.clone(),
@@ -411,6 +412,7 @@ pub fn tools_list() -> Value {
                     "worktree_branch": { "type": "string" },
                     "agents_enabled": { "type": "boolean" },
                     "agent_count": { "type": "integer", "minimum": 1, "maximum": 40 },
+                    "permissions": { "type": "string", "enum": ["auto", "manual", "bypass"], "description": "Optional permission mode for edit sessions." },
                     "dry_run": { "type": "boolean" },
                     "state_dir": { "type": "string" }
                 }), &["prompt"])
@@ -423,6 +425,7 @@ pub fn tools_list() -> Value {
                     "prompt": { "type": "string" },
                     "request_id": { "type": "string", "description": "Optional client idempotency key for active-session inbox queueing." },
                     "mode": { "type": "string", "enum": ["plan", "edit"] },
+                    "permissions": { "type": "string", "enum": ["auto", "manual", "bypass"] },
                     "state_dir": { "type": "string" }
                 }), &["session_id", "prompt"])
             },
@@ -521,6 +524,96 @@ pub fn tools_list() -> Value {
                     "run_dir": { "type": "string" },
                     "state_dir": { "type": "string" }
                 }), &["scope_id", "key", "text"])
+            },
+            {
+                "name": "omnigraph_status",
+                "description": "Inspect Omnigraph branch/store availability, active branches, atom counts, and head commit state for the target project.",
+                "inputSchema": schema(json!({
+                    "branch": { "type": "string" },
+                    "state_dir": { "type": "string" }
+                }), &[])
+            },
+            {
+                "name": "omnigraph_atoms",
+                "description": "Query, filter, paginate, or search Omnigraph context atoms, overlay code edges, and violation markers.",
+                "inputSchema": schema(json!({
+                    "branch": { "type": "string" },
+                    "snapshot": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "query": { "type": "string", "description": "Filter/search text." },
+                    "q": { "type": "string", "description": "Alias for query filter/search text." },
+                    "session_id": { "type": "string" },
+                    "limit": { "type": "integer", "minimum": 1, "maximum": 500 },
+                    "offset": { "type": "integer", "minimum": 0 },
+                    "cursor": { "type": "string" },
+                    "search": { "type": "boolean", "description": "Use scored full-text search (omnigraph.search) when true." },
+                    "state_dir": { "type": "string" }
+                }), &[])
+            },
+            {
+                "name": "omnigraph_publish",
+                "description": "Publish a structured context atom (finding, decision, insight, or fact) to Omnigraph with optional linked files and provenance.",
+                "inputSchema": schema(json!({
+                    "title": { "type": "string" },
+                    "kind": { "type": "string" },
+                    "summary": { "type": "string" },
+                    "body": { "type": "string" },
+                    "branch": { "type": "string" },
+                    "atom_id": { "type": "string" },
+                    "session_id": { "type": "string" },
+                    "tags": { "type": "array", "items": { "type": "string" } },
+                    "files": { "type": "array", "items": { "type": "string" } },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "pin_priority": { "type": "integer" },
+                    "expected_commit": { "type": "string" },
+                    "state_dir": { "type": "string" }
+                }), &["title"])
+            },
+            {
+                "name": "omnigraph_branches_diff",
+                "description": "Compare Omnigraph atoms, edges, and divergent updates between a source branch and target branch (default: main).",
+                "inputSchema": schema(json!({
+                    "source": { "type": "string" },
+                    "target": { "type": "string" },
+                    "state_dir": { "type": "string" }
+                }), &["source"])
+            },
+            {
+                "name": "omnigraph_merge_keep",
+                "description": "Resolve an Omnigraph divergent branch atom by keeping one branch's version onto the target branch.",
+                "inputSchema": schema(json!({
+                    "atom_id": { "type": "string" },
+                    "from": { "type": "string" },
+                    "to": { "type": "string" },
+                    "expected_updated_at": { "type": "string" },
+                    "replaced_updated_at": { "type": "string" },
+                    "state_dir": { "type": "string" }
+                }), &["atom_id", "from"])
+            },
+            {
+                "name": "system_graph_status",
+                "description": "Inspect cross-service system graph readiness, service code graph states, and semantic/layer health for system.json.",
+                "inputSchema": schema(json!({
+                    "config_path": { "type": "string", "description": "Optional system config path (default: system.json)." },
+                    "check": { "type": "boolean", "description": "Re-verify file/git staleness when true." },
+                    "service": { "type": "string" },
+                    "state_dir": { "type": "string" }
+                }), &[])
+            },
+            {
+                "name": "orch_permission_mode",
+                "description": "Inspect or update a session's permission mode (auto|manual|bypass|default), respond to pending permission requests, or revoke remembered session rules.",
+                "inputSchema": schema(json!({
+                    "session_id": { "type": "string" },
+                    "mode": { "type": "string", "enum": ["auto", "manual", "bypass", "default"] },
+                    "request_id": { "type": "string" },
+                    "decision": { "type": "string", "enum": ["allow", "allow_session", "deny"] },
+                    "answers": { "type": "object" },
+                    "revoke_rule_id": { "type": "string" },
+                    "revoke_rule_key": { "type": "string" },
+                    "revoke_all": { "type": "boolean" },
+                    "state_dir": { "type": "string" }
+                }), &["session_id"])
             }
         ]
     })
@@ -737,6 +830,9 @@ async fn dispatch_tool(cache: &RuntimeCache, name: &str, args: &Value) -> Result
             if let Some(v) = args.get("agent_count").and_then(Value::as_u64) {
                 body["agent_count"] = json!(v);
             }
+            if let Some(perms) = args.get("permissions").and_then(Value::as_str) {
+                body["permissions"] = json!(perms);
+            }
             if workflow == "fleet-review" {
                 body["fleet"] = json!({
                     "dry_run": args.get("dry_run").and_then(Value::as_bool).unwrap_or(false)
@@ -794,6 +890,9 @@ async fn dispatch_tool(cache: &RuntimeCache, name: &str, args: &Value) -> Result
             let mut body = json!({ "prompt": prompt });
             if let Some(m) = args.get("mode").and_then(Value::as_str) {
                 body["mode"] = json!(m);
+            }
+            if let Some(perms) = args.get("permissions").and_then(Value::as_str) {
+                body["permissions"] = json!(perms);
             }
             let reply = services
                 .request(
@@ -1187,6 +1286,272 @@ async fn dispatch_tool(cache: &RuntimeCache, name: &str, args: &Value) -> Result
             store
                 .write_note(scope_id, key, kind, status, text, &sources, ttl_seconds)
                 .map_err(|e| RuntimeError::invalid(e.to_string()))
+        }
+        "omnigraph_status" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let mut query = Map::new();
+            query.insert("project_id".into(), json!(project_id));
+            if let Some(branch) = args.get("branch").and_then(Value::as_str) {
+                query.insert("branch".into(), json!(branch));
+            }
+            let reply = services
+                .request(
+                    "omnigraph.status",
+                    json!({ "params": {}, "query": Value::Object(query), "body": {} }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "omnigraph_atoms" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let mut query = Map::new();
+            query.insert("project_id".into(), json!(project_id));
+            if let Some(branch) = args.get("branch").and_then(Value::as_str) {
+                query.insert("branch".into(), json!(branch));
+            }
+            if let Some(snapshot) = args.get("snapshot").and_then(Value::as_str) {
+                query.insert("snapshot".into(), json!(snapshot));
+            }
+            if let Some(kind) = args.get("kind").and_then(Value::as_str) {
+                query.insert("kind".into(), json!(kind));
+            }
+            if let Some(q) = args
+                .get("q")
+                .and_then(Value::as_str)
+                .or_else(|| args.get("query").and_then(Value::as_str))
+            {
+                query.insert("q".into(), json!(q));
+            }
+            if let Some(sid) = args.get("session_id").and_then(Value::as_str) {
+                query.insert("session_id".into(), json!(sid));
+            }
+            if let Some(limit) = args.get("limit").and_then(Value::as_u64) {
+                query.insert("limit".into(), json!(limit.to_string()));
+            }
+            if let Some(offset) = args.get("offset").and_then(Value::as_u64) {
+                query.insert("offset".into(), json!(offset.to_string()));
+            }
+            if let Some(cursor) = args.get("cursor").and_then(Value::as_str) {
+                query.insert("cursor".into(), json!(cursor));
+            }
+            let op = if args.get("search").and_then(Value::as_bool) == Some(true) {
+                "omnigraph.search"
+            } else {
+                "omnigraph.graph"
+            };
+            let reply = services
+                .request(
+                    op,
+                    json!({ "params": {}, "query": Value::Object(query), "body": {} }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "omnigraph_publish" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let mut body = Map::new();
+            body.insert("project_id".into(), json!(project_id));
+            for key in [
+                "title",
+                "kind",
+                "summary",
+                "body",
+                "branch",
+                "atom_id",
+                "session_id",
+                "tags",
+                "files",
+                "confidence",
+                "pin_priority",
+                "expected_commit",
+            ] {
+                if let Some(val) = args.get(key)
+                    && !val.is_null()
+                {
+                    body.insert(key.into(), val.clone());
+                }
+            }
+            let reply = services
+                .request(
+                    "omnigraph.publish",
+                    json!({ "params": {}, "query": {}, "body": Value::Object(body) }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "omnigraph_branches_diff" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let source = args["source"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RuntimeError::invalid("Missing required `source`"))?;
+            let target = args
+                .get("target")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("main");
+            let reply = services
+                .request(
+                    "omnigraph.branch_diff",
+                    json!({
+                        "params": {},
+                        "query": { "project_id": project_id, "source": source, "target": target },
+                        "body": {}
+                    }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "omnigraph_merge_keep" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let atom_id = args["atom_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RuntimeError::invalid("Missing required `atom_id`"))?;
+            let from = args["from"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RuntimeError::invalid("Missing required `from`"))?;
+            let to = args
+                .get("to")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("main");
+            let mut body = json!({
+                "action": "keep",
+                "project_id": project_id,
+                "atom_id": atom_id,
+                "from": from,
+                "to": to,
+            });
+            if let Some(v) = args.get("expected_updated_at").and_then(Value::as_str) {
+                body["expected_updated_at"] = json!(v);
+            }
+            if let Some(v) = args.get("replaced_updated_at").and_then(Value::as_str) {
+                body["replaced_updated_at"] = json!(v);
+            }
+            let reply = services
+                .request(
+                    "omnigraph.branch_act",
+                    json!({ "params": {}, "query": {}, "body": body }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "system_graph_status" => {
+            let services = cache.for_state(&state, &project).await?;
+            let project_id = ensure_project(services.as_ref(), &project).await?;
+            let mut query = Map::new();
+            query.insert("project_id".into(), json!(project_id));
+            if let Some(cfg) = args.get("config_path").and_then(Value::as_str)
+                && !cfg.trim().is_empty()
+            {
+                query.insert("config_path".into(), json!(cfg));
+            }
+            if let Some(check) = args.get("check").and_then(Value::as_bool) {
+                query.insert("check".into(), json!(if check { "1" } else { "0" }));
+            }
+            if let Some(svc) = args.get("service").and_then(Value::as_str)
+                && !svc.trim().is_empty()
+            {
+                query.insert("service".into(), json!(svc));
+            }
+            let reply = services
+                .request(
+                    "system_graph.status",
+                    json!({ "params": {}, "query": Value::Object(query), "body": {} }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
+        }
+        "orch_permission_mode" => {
+            let services = cache.for_state(&state, &project).await?;
+            let sid = args["session_id"]
+                .as_str()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| RuntimeError::invalid("Missing required `session_id`"))?;
+            if let Some(req_id) = args
+                .get("request_id")
+                .and_then(Value::as_str)
+                .filter(|s| !s.trim().is_empty())
+            {
+                let decision = args["decision"]
+                    .as_str()
+                    .filter(|s| !s.trim().is_empty())
+                    .ok_or_else(|| RuntimeError::invalid("Missing required `decision` when `request_id` is set"))?;
+                let mut body = json!({ "decision": decision });
+                if let Some(answers) = args.get("answers")
+                    && !answers.is_null()
+                {
+                    body["answers"] = answers.clone();
+                }
+                let reply = services
+                    .request(
+                        "sessions.permission",
+                        json!({
+                            "params": { "session_id": sid, "request_id": req_id },
+                            "query": {},
+                            "body": body
+                        }),
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::invalid(e.message))?;
+                return payload_json(reply);
+            }
+            if args.get("revoke_all").and_then(Value::as_bool) == Some(true)
+                || args.get("revoke_rule_id").and_then(Value::as_str).is_some()
+                || args.get("revoke_rule_key").and_then(Value::as_str).is_some()
+            {
+                let mut body = Map::new();
+                if let Some(all) = args.get("revoke_all").and_then(Value::as_bool) {
+                    body.insert("all".into(), json!(all));
+                }
+                if let Some(id) = args.get("revoke_rule_id").and_then(Value::as_str) {
+                    body.insert("id".into(), json!(id));
+                }
+                if let Some(rk) = args.get("revoke_rule_key").and_then(Value::as_str) {
+                    body.insert("rule_key".into(), json!(rk));
+                }
+                let reply = services
+                    .request(
+                        "sessions.permission_rules_delete",
+                        json!({
+                            "params": { "session_id": sid },
+                            "query": {},
+                            "body": Value::Object(body)
+                        }),
+                    )
+                    .await
+                    .map_err(|e| RuntimeError::invalid(e.message))?;
+                return payload_json(reply);
+            }
+            let mut body = Map::new();
+            if let Some(mode) = args.get("mode").and_then(Value::as_str) {
+                body.insert("mode".into(), json!(mode));
+            }
+            let reply = services
+                .request(
+                    "sessions.permission_mode",
+                    json!({
+                        "params": { "session_id": sid },
+                        "query": {},
+                        "body": Value::Object(body)
+                    }),
+                )
+                .await
+                .map_err(|e| RuntimeError::invalid(e.message))?;
+            payload_json(reply)
         }
         other => Err(RuntimeError::not_found(format!("Unknown MCP tool `{other}`"))),
     }

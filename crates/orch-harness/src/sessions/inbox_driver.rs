@@ -62,7 +62,8 @@ impl Sessions {
         let session = self.store.get(sid)?;
         let frozen = crate::inbox::authority(&session)?;
         let generation = self.store.generation(sid)?;
-        let _ = session["provider"].as_str().unwrap_or("");
+        self.commands()?
+            .check(session["provider"].as_str().unwrap_or(""), &prompt, None)?;
         let lease = self
             .job_lease(Job {
                 sid: sid.into(),
@@ -155,6 +156,8 @@ impl Sessions {
                 }
             };
             let prompt = item["prompt"].as_str().unwrap_or("");
+            self.commands()?
+                .check(session["provider"].as_str().unwrap_or(""), prompt, None)?;
             let lease = self
                 .job_lease(Job {
                     sid: sid.clone(),

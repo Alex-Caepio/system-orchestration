@@ -3,7 +3,9 @@
 //! and verified membership precede ResumeThread. Stable Rust, no Nt* resume API.
 //! The trusted guardian stays outside the per-run Job to retain runner exclusion
 //! until Job accounting proves that every native descendant has stopped.
-use super::{Control, Limits, Output, RunObserver};
+use super::{
+    Control, Interactive, Limits, Output, RunObserver, deadline_elapsed, interactive_read_wait,
+};
 use crate::{HarnessError, Result};
 use serde_json::Value;
 use std::{
@@ -1943,6 +1945,110 @@ async fn run_engine(
     match (finished, execute) {
         (Err(e), _) if e.code == "cleanup-unconfirmed" => Err(e),
         (_, Err(e)) => Err(e),
+        (result, _) => result,
+    }
+}
+/// Runs a native process that keeps its input open: `input` is written
+/// first, then every line `io` delivers, until the exchange finishes.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "The stable native process boundary keeps the exchange, observer and runner custody explicit."
+)]
+pub async fn run_interactive(
+    argv: &[String],
+    cwd: &Path,
+    environment: &BTreeMap<String, String>,
+    remove: &[String],
+    input: &[u8],
+    limits: Limits,
+    cancel: Arc<AtomicBool>,
+    runner_lock: Option<Arc<File>>,
+    observer: Option<Arc<dyn RunObserver>>,
+    deadline: Option<Instant>,
+    mut io: Interactive,
+    mut event: impl FnMut(&[u8]) -> Result<()> + Send,
+) -> Result<Output> {
+    if deadline.is_some_and(|until| Instant::now() >= until) {
+        return Err(timeout_error());
+    }
+    // The session itself keeps neither time limit nor deadline: waiting for a person pauses both.
+    let budget = limits.seconds;
+    let mut session = NativeSession::spawn_options_until(
+        argv,
+        cwd,
+        environment,
+        remove,
+        Limits {
+            seconds: None,
+            ..limits
+        },
+        cancel,
+        runner_lock,
+        None,
+        false,
+        observer,
+        None,
+    )?;
+    let started = Instant::now();
+    let mut paused = Duration::ZERO;
+    let mut tick = started;
+    let mut grace: Option<Instant> = None;
+    let mut stopped = false;
+    let execute = async {
+        session.write(input)?;
+        let mut open = true;
+        loop {
+            while open {
+                match io.input.try_recv() {
+                    Ok(bytes) => session.write(&bytes)?,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        session.close_input();
+                        open = false;
+                    }
+                }
+            }
+            let now = Instant::now();
+            if io.waiting.load(Ordering::Acquire) > 0 {
+                paused += now.saturating_duration_since(tick);
+            }
+            tick = now;
+            if io.finished.load(Ordering::Acquire) {
+                let until = *grace.get_or_insert(now + CLEANUP);
+                if now >= until {
+                    stopped = true;
+                    break;
+                }
+            }
+            if budget.is_some_and(|seconds| {
+                started.elapsed().saturating_sub(paused) >= Duration::from_secs(seconds)
+            }) || deadline_elapsed(now, deadline, paused)
+            {
+                return Err(timeout_error());
+            }
+            let wait = interactive_read_wait(now, deadline, paused);
+            match tokio::time::timeout(wait, session.next_line()).await {
+                Err(_) => continue,
+                Ok(Ok(Some(packet))) => event(&packet)?,
+                Ok(Ok(None)) => break,
+                Ok(Err(error)) => return Err(error),
+            }
+        }
+        Ok(())
+    }
+    .await;
+    let finished = session.finish().await;
+    match (finished, execute) {
+        (Err(e), _) if e.code == "cleanup-unconfirmed" => Err(e),
+        (_, Err(e)) => Err(e),
+        (Ok(mut output), Ok(())) => {
+            output.seconds = (output.seconds - paused.as_secs_f64()).max(0.0);
+            if stopped {
+                // The host answered everything it was asked and was then stopped.
+                output.code = 0;
+            }
+            Ok(output)
+        }
         (result, _) => result,
     }
 }

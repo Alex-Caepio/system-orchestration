@@ -1,13 +1,20 @@
 //! Exercise the real manager/SQLite path at a controllable synchronous host port.
 use super::*;
+use crate::{
+    bindings::SystemsDomain,
+    services::{Domain, Payload},
+};
 use orch_core::{Result as CoreResult, RuntimeError};
 use orch_system::{Project, SessionBridge, SystemManager};
+use serde_json::{Value, json};
 use std::{
+    collections::BTreeMap,
     fs::File,
     future::Future,
+    path::PathBuf,
     pin::Pin,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
         mpsc,
     },

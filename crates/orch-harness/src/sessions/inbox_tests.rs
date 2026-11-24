@@ -11,6 +11,12 @@ fn running(fixture: &Fixture) -> (String, Job, Value) {
             &json!({"status":"running","native_session_id":"native-1"}),
         )
         .unwrap();
+    *fixture.sessions.commands.lock().unwrap() =
+        Some(Arc::new(crate::commands::CommandCatalog::new(
+            fixture.sessions.store.clone(),
+            fixture.sessions.source.clone(),
+            fixture.sessions.providers.providers.clone(),
+        )));
     fixture
         .results
         .start_launch(&sid, &job.generation, None)
@@ -425,8 +431,10 @@ async fn inbox_http_enforces_token_exact_body_idempotency_limits_and_cancellatio
         "results",
         "delivery",
         "projects",
+        "commands",
         "files",
         "providers",
+        "omnigraph",
         "working_memory",
     ]
     .into_iter()

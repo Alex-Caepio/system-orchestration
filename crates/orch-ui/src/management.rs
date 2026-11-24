@@ -7,7 +7,7 @@ pub fn registered(projects: V) {
     let old = dom::value("project");
     m::write(|s| s.boot["projects"] = projects);
     session::populate();
-    if m::project(&old).is_object() {
+    if !m::project(&old).is_null() {
         session::sync_project(&old);
     }
 }

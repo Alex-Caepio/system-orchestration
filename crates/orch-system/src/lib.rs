@@ -1,6 +1,8 @@
 //! Native system passports, bounded discovery, reviewed plans, working memory and execution.
 pub mod backend;
+pub mod boundary;
 pub mod catalog;
+pub mod commands;
 pub mod common;
 pub mod discovery;
 pub mod editor;
@@ -11,13 +13,26 @@ pub mod planner;
 pub mod routes;
 pub mod runner;
 pub mod strict;
+pub mod system_graph;
 pub mod workers;
 pub mod working_memory;
 pub use backend::{Project, SessionBridge};
 pub use manager::SystemManager;
 pub use routes::{execute, execute_async, initialize};
 pub use runner::{SharedDispatchContext, drive_run_with_context};
-pub use workers::{
-    AgentSignal, run_discovery_request_with_adapter, run_system_request_with_adapter,
+pub use system_graph::{
+    ArchitectureLayerRule, ChangedEntityEntry, ChangedFileEntry, CodeGraphBridge, CodeReference,
+    ContractLinkDetail, CrossServiceImpactQuery, DispatchEvidence, DispatchGraphContext,
+    EvidenceFileChange, LayerViolationEntry, NoopCodeGraphBridge, ServiceCodeSummary,
+    ServiceGraphOffer, SystemArchitectureRules, SystemEdge, SystemGraph, SystemMapQuery,
+    SystemNode, collect_git_service_summaries, collect_run_service_summaries,
+    enrich_summaries_from_graph_store, git_changes_since, git_worktree_changes, load_run_evidence,
+    summarize_run_evidence, system_graph_status,
 };
-pub use workers::{run_discovery_request, run_system_request};
+pub use workers::{
+    AgentSignal, bwrap_ro_bind_args, macos_seatbelt_read_rules, offers_for_step, prepare_worker,
+    prepare_worker_for_transport, run_discovery_request, run_discovery_request_with_adapter,
+    run_system_request, run_system_request_with_adapter,
+    run_system_request_with_adapter_and_approvals, run_system_request_with_bridge,
+    run_system_request_with_bridge_and_approvals,
+};
