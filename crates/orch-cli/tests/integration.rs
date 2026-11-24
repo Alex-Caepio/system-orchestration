@@ -878,3 +878,154 @@ async fn embedded_wasm_http_workbench_serves_trimmed_assets_and_working_memory_a
         .unwrap();
     services.close().await.unwrap();
 }
+
+#[test]
+fn antigravity_hook_cli_and_gemini_plugin_cwd_guard() {
+    let tmp = tempdir().unwrap();
+    let repo = tmp.path().join("repo");
+    std::fs::create_dir_all(repo.join(".antigravity/agents")).unwrap();
+    init_git_repo(&repo);
+    std::fs::write(
+        repo.join(".antigravity/agents/php-writer.md"),
+        "---\nname: php-writer\nwrites: true\n---\n\nWrite agent\n",
+    )
+    .unwrap();
+
+    // 1. CLI hook `--host antigravity` / `--host agy` + auto-detect camelCase stdin JSON
+    let run_hook = |args: &[&str], body: &Value| {
+        let mut child = Command::new(bin())
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(serde_json::to_string(body).unwrap().as_bytes())
+            .unwrap();
+        child.wait_with_output().unwrap()
+    };
+
+    let gate_payload = json!({
+        "hookEventName": "PreToolUse",
+        "conversationId": "conv-agy-1",
+        "workspacePaths": [&repo],
+        "toolCall": {
+            "name": "invoke_subagent",
+            "args": {
+                "TypeName": "php-writer",
+                "Prompt": "Modify service",
+                "Workspace": "inherit"
+            }
+        }
+    });
+    let first = run_hook(&["hook", "subagent-gate", "--host", "antigravity"], &gate_payload);
+    assert_eq!(first.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&first.stdout).unwrap(),
+        json!({ "decision": "allow" })
+    );
+
+    let deny = run_hook(&["hook", "subagent-gate", "--host", "agy"], &gate_payload);
+    assert_eq!(deny.status.code(), Some(0));
+    let deny_json: Value = serde_json::from_slice(&deny.stdout).unwrap();
+    assert_eq!(deny_json["decision"], "deny");
+    assert!(deny_json["reason"].as_str().unwrap().contains("php-writer"));
+
+    let disp_payload = json!({
+        "hookEventName": "PostToolUse",
+        "conversationId": "conv-agy-1",
+        "workspacePaths": [&repo],
+        "toolCall": {
+            "name": "invoke_subagent",
+            "args": {
+                "Role": "php-writer",
+                "Prompt": "Modified service",
+                "Workspace": "inherit"
+            }
+        }
+    });
+    let disp = run_hook(&["hook", "subagent-dispatch"], &disp_payload);
+    assert_eq!(disp.status.code(), Some(0));
+    assert_eq!(serde_json::from_slice::<Value>(&disp.stdout).unwrap(), json!({}));
+
+    let again = run_hook(&["hook", "subagent-gate"], &gate_payload);
+    assert_eq!(again.status.code(), Some(0));
+    assert_eq!(
+        serde_json::from_slice::<Value>(&again.stdout).unwrap(),
+        json!({ "decision": "allow" })
+    );
+    let _ = run_hook(&["hook", "subagent-dispatch", "--host", "antigravity"], &disp_payload);
+
+    // 2. `.gemini/config/plugins/<name>/` with plugin.json + mcp_config.json triggers plugin-cwd guard
+    let agy_plugin = tmp
+        .path()
+        .join(".gemini")
+        .join("config")
+        .join("plugins")
+        .join("system-orchestration");
+    std::fs::create_dir_all(&agy_plugin).unwrap();
+    std::fs::write(agy_plugin.join("plugin.json"), "{}").unwrap();
+    std::fs::write(agy_plugin.join("mcp_config.json"), "{}").unwrap();
+
+    let mut mcp = Command::new(bin())
+        .arg("mcp")
+        .current_dir(&agy_plugin)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut stdin = mcp.stdin.take().unwrap();
+    let mut stdout = BufReader::new(mcp.stdout.take().unwrap());
+
+    let _ = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": { "protocolVersion": "2025-06-18", "capabilities": {} }
+        }),
+    );
+    writeln!(
+        stdin,
+        "{}",
+        json!({ "jsonrpc": "2.0", "method": "notifications/initialized" })
+    )
+    .unwrap();
+    stdin.flush().unwrap();
+
+    for (id, tool, args) in [
+        (2, "system_graph_status", json!({})),
+        (3, "omnigraph_status", json!({ "project": "." })),
+        (4, "orch_session_start", json!({ "project": "./.", "prompt": "p", "provider": "codex", "mode": "plan" })),
+    ] {
+        let resp = rpc(
+            &mut stdin,
+            &mut stdout,
+            json!({ "jsonrpc": "2.0", "id": id, "method": "tools/call", "params": { "name": tool, "arguments": args } }),
+        );
+        assert_eq!(resp["result"]["isError"], true, "{tool}: {resp}");
+    }
+
+    // Explicit external repo still succeeds from Antigravity plugin cwd!
+    let ok_call = rpc(
+        &mut stdin,
+        &mut stdout,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": { "name": "omnigraph_status", "arguments": { "project": repo } }
+        }),
+    );
+    assert_eq!(ok_call["result"]["isError"], false, "{ok_call}");
+
+    drop(stdin);
+    assert!(mcp.wait().unwrap().success());
+    assert!(!agy_plugin.join(".orch").exists());
+}

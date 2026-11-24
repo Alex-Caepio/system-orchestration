@@ -10,6 +10,7 @@ pub fn session(payload: &Value) -> String {
     let source = payload["session_id"]
         .as_str()
         .or_else(|| payload["conversation_id"].as_str())
+        .or_else(|| payload["conversationId"].as_str())
         .unwrap_or("");
     let value: String = source
         .chars()
@@ -259,7 +260,11 @@ pub fn take_writer(root: &Path, host: &str, agent: &str) -> Result<Option<String
     let key = repo_key(root);
     let name = format!(
         "{}-write-agent-lock-{key}",
-        if host == "cursor" { "cursor" } else { "claude" }
+        match host {
+            "cursor" => "cursor",
+            "antigravity" => "antigravity",
+            _ => "claude",
+        }
     );
     let _guard = orch_core::native::DrainGuard::acquire(&folder, &format!("{name}.guard"))?
         .ok_or_else(|| RuntimeError::conflict("Write-agent spawning is already in progress"))?;
@@ -292,7 +297,7 @@ pub fn take_writer(root: &Path, host: &str, agent: &str) -> Result<Option<String
 }
 pub fn release_writer(root: &Path, agent: &str) -> Result<()> {
     let folder = writer_folder()?;
-    for host in ["claude", "cursor"] {
+    for host in ["claude", "cursor", "antigravity"] {
         let name = format!("{host}-write-agent-lock-{}", repo_key(root));
         let path = folder.join(&name);
         let Some(_guard) =

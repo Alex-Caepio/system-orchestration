@@ -29,7 +29,7 @@ fn usage() -> &'static str {
         "  orch-engine fleet <run|resume> [OPTIONS]\n",
         "  orch-engine serve [serve|start] [OPTIONS]\n",
         "  orch-engine attach [--project PATH] [--provider claude|codex|cursor] [--state-dir PATH] [--overlay-dir PATH] [-- ARGS...]\n",
-        "  orch-engine hook <subagent-gate|subagent-dispatch> [--project PATH] [--host claude|codex|cursor]\n",
+        "  orch-engine hook <subagent-gate|subagent-dispatch> [--project PATH] [--host antigravity|agy|claude|codex|cursor]\n",
         "  orch-engine mcp\n",
         "  orch-engine --help | --version\n"
     )
@@ -386,7 +386,7 @@ fn run_hook_cli(args: &[String]) -> Result<i32> {
         ));
     };
     if matches!(op, "-h" | "--help") {
-        println!("Usage: orch-engine hook <subagent-gate|subagent-dispatch> [--project PATH] [--host claude|codex|cursor]");
+        println!("Usage: orch-engine hook <subagent-gate|subagent-dispatch> [--project PATH] [--host antigravity|agy|claude|codex|cursor]");
         return Ok(0);
     }
     let rest = &args[1..];

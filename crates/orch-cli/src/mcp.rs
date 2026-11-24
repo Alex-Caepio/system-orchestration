@@ -65,13 +65,18 @@ impl RuntimeCache {
 }
 
 pub fn is_plugin_dir(path: &Path) -> bool {
+    let has_engine = path.join("bin/orch-engine").is_file()
+        || path.join("bin/orch-engine.exe").is_file();
+    let normalized = path.to_string_lossy().replace('\\', "/");
     path.join(".codex-plugin").is_dir()
         || path.join(".claude-plugin").is_dir()
-        || (path.join("bin/orch-engine").is_file() && !path.join("system.json").is_file())
-        || path
-            .to_string_lossy()
-            .replace('\\', "/")
-            .contains(".codex/plugins/cache")
+        || path.join(".antigravity-plugin/plugin.json").is_file()
+        || path.join(".gemini-plugin/plugin.json").is_file()
+        || (has_engine && !path.join("system.json").is_file())
+        || (has_engine
+            && (path.join("plugin.json").is_file() || path.join("mcp_config.json").is_file()))
+        || normalized.contains(".codex/plugins/cache")
+        || normalized.contains(".gemini/config/plugins")
 }
 
 /// Resolve `project` / `root` cleanly.
@@ -1650,4 +1655,45 @@ pub async fn serve_stdio() -> Result<()> {
     }
     cache.close_all().await;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_plugin_dir;
+
+    #[test]
+    fn recognizes_antigravity_and_gemini_plugin_roots() {
+        let tmp = tempfile::tempdir().unwrap();
+
+        let agy_dir = tmp.path().join("agy");
+        std::fs::create_dir_all(agy_dir.join(".antigravity-plugin")).unwrap();
+        std::fs::write(agy_dir.join(".antigravity-plugin/plugin.json"), "{}").unwrap();
+        assert!(is_plugin_dir(&agy_dir));
+
+        let gem_dir = tmp.path().join("gem");
+        std::fs::create_dir_all(gem_dir.join(".gemini-plugin")).unwrap();
+        std::fs::write(gem_dir.join(".gemini-plugin/plugin.json"), "{}").unwrap();
+        assert!(is_plugin_dir(&gem_dir));
+
+        let engine_only_cfg = tmp.path().join("cfg");
+        std::fs::create_dir_all(engine_only_cfg.join("bin")).unwrap();
+        std::fs::write(engine_only_cfg.join("bin/orch-engine"), "").unwrap();
+        std::fs::write(engine_only_cfg.join("plugin.json"), "{}").unwrap();
+        std::fs::write(engine_only_cfg.join("mcp_config.json"), "{}").unwrap();
+        std::fs::write(engine_only_cfg.join("system.json"), "{}").unwrap();
+        assert!(is_plugin_dir(&engine_only_cfg));
+
+        let cache_dir = tmp
+            .path()
+            .join(".gemini")
+            .join("config")
+            .join("plugins")
+            .join("system-orchestration");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        assert!(is_plugin_dir(&cache_dir));
+
+        let plain_repo = tmp.path().join("plain-repo");
+        std::fs::create_dir_all(&plain_repo).unwrap();
+        assert!(!is_plugin_dir(&plain_repo));
+    }
 }

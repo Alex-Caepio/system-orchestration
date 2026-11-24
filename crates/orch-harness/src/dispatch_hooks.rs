@@ -32,6 +32,79 @@ fn first<'a>(value: &'a Value, key: &str) -> Option<&'a str> {
     }
 }
 
+fn non_empty_str<'a>(val: Option<&'a Value>) -> Option<&'a str> {
+    val.and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
+fn normalize_host(raw: &str) -> String {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "antigravity" | "agy" => "antigravity".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+fn is_antigravity_payload(payload: &Value) -> bool {
+    payload.as_object().is_some_and(|map| {
+        map.contains_key("hookEventName")
+            || map.contains_key("toolCall")
+            || map.contains_key("workspacePaths")
+            || map.contains_key("conversationId")
+    })
+}
+
+fn extract_workspace_root(payload: &Value) -> Option<PathBuf> {
+    first(payload, "cwd")
+        .or_else(|| {
+            payload
+                .get("workspacePaths")
+                .and_then(Value::as_array)
+                .and_then(|items| items.iter().find_map(|v| non_empty_str(Some(v))))
+        })
+        .map(PathBuf::from)
+}
+
+fn extract_tool_name(payload: &Value) -> String {
+    non_empty_str(payload.pointer("/toolCall/name"))
+        .or_else(|| first(payload, "tool_name"))
+        .unwrap_or("")
+        .to_ascii_lowercase()
+}
+
+fn extract_agent_name(payload: &Value) -> Option<&str> {
+    non_empty_str(payload.pointer("/toolCall/args/TypeName"))
+        .or_else(|| non_empty_str(payload.pointer("/toolCall/args/Role")))
+        .or_else(|| first(payload, "subagent_type"))
+        .or_else(|| first(payload, "agent_type"))
+        .or_else(|| first(payload, "TypeName"))
+        .or_else(|| first(payload, "Role"))
+}
+
+fn extract_dispatch_note(payload: &Value) -> String {
+    let base = first(payload, "last_assistant_message")
+        .or_else(|| first(payload, "status"))
+        .or_else(|| non_empty_str(payload.pointer("/toolCall/args/Prompt")))
+        .or_else(|| first(payload, "Prompt"))
+        .unwrap_or("");
+    let normalized = base.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut parts = Vec::new();
+    if let Some(ws) = non_empty_str(payload.pointer("/toolCall/args/Workspace")) {
+        parts.push(format!("workspace={ws}"));
+    }
+    if let Some(conv) = first(payload, "conversationId") {
+        parts.push(format!("session={conv}"));
+    }
+    let combined = if parts.is_empty() {
+        normalized
+    } else if normalized.is_empty() {
+        parts.join(" ")
+    } else {
+        format!("{normalized} ({})", parts.join(", "))
+    };
+    combined.chars().take(160).collect()
+}
+
 fn strings(value: &Value, keys: &[&str]) -> Vec<String> {
     fn visit(value: &Value, keys: &[&str], output: &mut Vec<String>) {
         match value {
@@ -96,43 +169,59 @@ fn resolve_task_id(project: &Path) -> Option<String> {
 
 fn roster(project: &Path, host: &str) -> BTreeMap<String, bool> {
     let mut result = BTreeMap::new();
-    let dir = match host {
-        "cursor" => ".cursor/agents",
-        "codex" => ".codex/agents",
-        _ => ".claude/agents",
+    let dirs: &[&str] = match host {
+        "cursor" => &[".cursor/agents"],
+        "codex" => &[".codex/agents"],
+        "antigravity" => &[".antigravity/agents", ".gemini/agents", ".claude/agents"],
+        _ => &[".claude/agents"],
     };
-    let folder = project.join(dir);
-    let Ok(entries) = std::fs::read_dir(&folder) else {
-        return result;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("md") {
-            continue;
-        }
-        let Ok(text) = fs::read_text(&path) else {
+    for dir in dirs {
+        let folder = project.join(dir);
+        let Ok(entries) = std::fs::read_dir(&folder) else {
             continue;
         };
-        let mut lines = text.lines();
-        if lines.next() != Some("---") {
-            continue;
-        }
-        let front = lines.take_while(|line| *line != "---").collect::<Vec<_>>();
-        let field = |key: &str| {
-            front.iter().find_map(|line| {
-                line.strip_prefix(&format!("{key}:"))
-                    .map(|value| value.trim().trim_matches('"').to_string())
-            })
-        };
-        if let Some(name) = field("name").filter(|name| !name.is_empty()) {
-            result.insert(name, field("writes").as_deref() == Some("true"));
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("md") {
+                continue;
+            }
+            let Ok(text) = fs::read_text(&path) else {
+                continue;
+            };
+            let mut lines = text.lines();
+            if lines.next() != Some("---") {
+                continue;
+            }
+            let front = lines.take_while(|line| *line != "---").collect::<Vec<_>>();
+            let field = |key: &str| {
+                front.iter().find_map(|line| {
+                    line.strip_prefix(&format!("{key}:"))
+                        .map(|value| value.trim().trim_matches('"').to_string())
+                })
+            };
+            if let Some(name) = field("name").filter(|name| !name.is_empty()) {
+                result
+                    .entry(name)
+                    .or_insert_with(|| field("writes").as_deref() == Some("true"));
+            }
         }
     }
     result
 }
 
 fn gate_reply(host: &str, allow: bool, message: &str) -> Result<HookOutcome> {
-    if host == "cursor" {
+    if host == "antigravity" {
+        let body = if allow {
+            json!({"decision": "allow"})
+        } else {
+            json!({"decision": "deny", "reason": message})
+        };
+        Ok(HookOutcome {
+            code: 0,
+            stdout: format!("{body}\n").into_bytes(),
+            stderr: Vec::new(),
+        })
+    } else if host == "cursor" {
         let body = if allow {
             json!({"permission": "allow"})
         } else {
@@ -156,6 +245,7 @@ fn gate_reply(host: &str, allow: bool, message: &str) -> Result<HookOutcome> {
 
 pub fn subagent_gate(project: &Path, host: &str, payload: &Value) -> Result<HookOutcome> {
     let root = project_root(project);
+    let host = normalize_host(host);
     if host == "codex" {
         let policy_blocks = std::env::var_os("ORCH_BLOCK_BUILTIN_AGENTS").is_some();
         if policy_blocks {
@@ -172,36 +262,39 @@ pub fn subagent_gate(project: &Path, host: &str, payload: &Value) -> Result<Hook
                 .any(|name| forbidden.contains(&name.to_ascii_lowercase().as_str()))
             {
                 return gate_reply(
-                    host,
+                    &host,
                     false,
                     "BLOCKED: Codex built-in subagents are disabled by orchestration policy in this workspace.",
                 );
             }
         }
-        return gate_reply(host, true, "");
+        return gate_reply(&host, true, "");
     }
-    let tool = first(payload, "tool_name").unwrap_or("").to_ascii_lowercase();
-    if host != "cursor" && !["agent", "task"].contains(&tool.as_str()) {
-        return gate_reply(host, true, "");
+    let tool = extract_tool_name(payload);
+    if host == "antigravity" {
+        if !["invoke_subagent", "agent", "task"].contains(&tool.as_str()) {
+            return gate_reply(&host, true, "");
+        }
+    } else if host != "cursor" && !["agent", "task"].contains(&tool.as_str()) {
+        return gate_reply(&host, true, "");
     }
-    let Some(agent) = first(payload, "subagent_type").or_else(|| first(payload, "agent_type"))
-    else {
-        return gate_reply(host, true, "");
+    let Some(agent) = extract_agent_name(payload) else {
+        return gate_reply(&host, true, "");
     };
-    let roster = roster(&root, host);
+    let roster = roster(&root, &host);
     if roster.is_empty() {
-        return gate_reply(host, true, "");
+        return gate_reply(&host, true, "");
     }
     let Some(writes) = roster.get(agent) else {
-        return gate_reply(host, true, "");
+        return gate_reply(&host, true, "");
     };
     if !writes {
-        return gate_reply(host, true, "");
+        return gate_reply(&host, true, "");
     }
-    match counters::take_writer(&root, host, agent) {
-        Ok(None) => gate_reply(host, true, ""),
+    match counters::take_writer(&root, &host, agent) {
+        Ok(None) => gate_reply(&host, true, ""),
         Ok(Some(holder)) => gate_reply(
-            host,
+            &host,
             false,
             &format!(
                 "BLOCKED: write-capable agent \"{}\" is already running; wait for completion before starting \"{}\".",
@@ -209,16 +302,16 @@ pub fn subagent_gate(project: &Path, host: &str, payload: &Value) -> Result<Hook
                 safe_type(agent),
             ),
         ),
-        Err(error) => gate_reply(host, false, &format!("BLOCKED: {error}")),
+        Err(error) => gate_reply(&host, false, &format!("BLOCKED: {error}")),
     }
 }
 
 pub fn subagent_dispatch(project: &Path, host: &str, payload: &Value) -> Result<HookOutcome> {
     let root = project_root(project);
-    let _ = host;
+    let host = normalize_host(host);
     let relative = ".orch/unrecorded-completions";
     let relay = root.join(relative);
-    if first(payload, "hook_event_name") == Some("PostToolUse") {
+    if host != "antigravity" && first(payload, "hook_event_name") == Some("PostToolUse") {
         if !relay.is_file() {
             return Ok(HookOutcome::default());
         }
@@ -257,26 +350,28 @@ pub fn subagent_dispatch(project: &Path, host: &str, payload: &Value) -> Result<
             stderr: Vec::new(),
         });
     }
-    let Some(agent) = first(payload, "agent_type").or_else(|| first(payload, "subagent_type"))
-    else {
-        return Ok(HookOutcome::default());
+
+    let empty_json_outcome = |stderr: Vec<u8>| HookOutcome {
+        code: 0,
+        stdout: if host == "antigravity" {
+            b"{}\n".to_vec()
+        } else {
+            Vec::new()
+        },
+        stderr,
+    };
+
+    let Some(agent) = extract_agent_name(payload) else {
+        return Ok(empty_json_outcome(Vec::new()));
     };
     let _ = counters::release_writer(&root, agent);
     let Some(task) = resolve_task_id(&root) else {
-        return Ok(HookOutcome::default());
+        return Ok(empty_json_outcome(Vec::new()));
     };
     if !root.join(".orch").is_dir() {
-        return Ok(HookOutcome::default());
+        return Ok(empty_json_outcome(Vec::new()));
     }
-    let note = first(payload, "last_assistant_message")
-        .or_else(|| first(payload, "status"))
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(160)
-        .collect::<String>();
+    let note = extract_dispatch_note(payload);
     let channel = LocalDispatchChannel::new(&root)?;
     if let Err(err) = channel.dispatch(
         &task,
@@ -289,13 +384,16 @@ pub fn subagent_dispatch(project: &Path, host: &str, payload: &Value) -> Result<
             "subagent-dispatch: failed to record completion of \"{}\": {err}",
             safe_type(agent),
         );
+        if host == "antigravity" {
+            return Ok(empty_json_outcome(format!("{message}\n").into_bytes()));
+        }
         return Ok(HookOutcome {
             code: 0,
             stdout: format!("{message}\n").into_bytes(),
             stderr: format!("{message}\n").into_bytes(),
         });
     }
-    Ok(HookOutcome::default())
+    Ok(empty_json_outcome(Vec::new()))
 }
 
 pub fn execute_hook(operation: &str, project: Option<&Path>, host: Option<&str>, stdin: &[u8]) -> Result<HookOutcome> {
@@ -306,10 +404,11 @@ pub fn execute_hook(operation: &str, project: Option<&Path>, host: Option<&str>,
     };
     let resolved_project = project
         .map(Path::to_path_buf)
-        .or_else(|| first(&payload, "cwd").map(PathBuf::from))
+        .or_else(|| extract_workspace_root(&payload))
         .unwrap_or(std::env::current_dir()?);
     let resolved_host = host
-        .map(str::to_string)
+        .map(normalize_host)
+        .or_else(|| is_antigravity_payload(&payload).then(|| "antigravity".to_owned()))
         .or_else(|| {
             if std::env::var_os("CLAUDE_PROJECT_DIR").is_some()
                 || std::env::var_os("CLAUDE_PLUGIN_ROOT").is_some()
@@ -326,5 +425,103 @@ pub fn execute_hook(operation: &str, project: Option<&Path>, host: Option<&str>,
         "subagent-gate" => subagent_gate(&resolved_project, &resolved_host, &payload),
         "subagent-dispatch" => subagent_dispatch(&resolved_project, &resolved_host, &payload),
         _ => Err(RuntimeError::invalid(format!("Unknown hook operation: {operation}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn antigravity_subagent_gate_and_dispatch_parse_camelcase_and_enforce_writer_lock() {
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(repo.join(".antigravity/agents")).unwrap();
+        std::fs::write(
+            repo.join(".antigravity/agents/php-writer.md"),
+            "---\nname: php-writer\nwrites: true\n---\n\nWrite agent\n",
+        )
+        .unwrap();
+
+        let payload = serde_json::to_vec(&json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "conv-12345",
+            "workspacePaths": [&repo],
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "TypeName": "php-writer",
+                    "Prompt": "Update controller",
+                    "Workspace": "inherit"
+                }
+            }
+        }))
+        .unwrap();
+
+        // Non-subagent Antigravity tool (`run_command`) always returns allow JSON.
+        let run_cmd_payload = serde_json::to_vec(&json!({
+            "hookEventName": "PreToolUse",
+            "workspacePaths": [&repo],
+            "toolCall": { "name": "run_command", "args": { "CommandLine": "git status" } }
+        }))
+        .unwrap();
+        let allow_run = execute_hook("subagent-gate", None, Some("agy"), &run_cmd_payload).unwrap();
+        assert_eq!(allow_run.code, 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&allow_run.stdout).unwrap(),
+            json!({ "decision": "allow" })
+        );
+
+        // First write-capable invoke_subagent succeeds with decision: allow (auto-detected host).
+        let first_gate = execute_hook("subagent-gate", None, None, &payload).unwrap();
+        assert_eq!(first_gate.code, 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&first_gate.stdout).unwrap(),
+            json!({ "decision": "allow" })
+        );
+
+        // Concurrent second invoke_subagent returns exit 0 with decision: deny + reason.
+        let second_gate = execute_hook("subagent-gate", None, Some("antigravity"), &payload).unwrap();
+        assert_eq!(second_gate.code, 0);
+        let deny_val: Value = serde_json::from_slice(&second_gate.stdout).unwrap();
+        assert_eq!(deny_val["decision"], "deny");
+        assert!(
+            deny_val["reason"]
+                .as_str()
+                .unwrap()
+                .contains("php-writer")
+        );
+
+        // PostToolUse subagent-dispatch releases lock and emits `{}` on stdout with exit 0.
+        let post_payload = serde_json::to_vec(&json!({
+            "hookEventName": "PostToolUse",
+            "conversationId": "conv-12345",
+            "workspacePaths": [&repo],
+            "toolCall": {
+                "name": "invoke_subagent",
+                "args": {
+                    "Role": "php-writer",
+                    "Prompt": "Updated controller",
+                    "Workspace": "inherit"
+                }
+            }
+        }))
+        .unwrap();
+        let post = execute_hook("subagent-dispatch", None, Some("antigravity"), &post_payload).unwrap();
+        assert_eq!(post.code, 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&post.stdout).unwrap(),
+            json!({})
+        );
+
+        // Lock released -> subsequent invoke_subagent allowed again!
+        let third_gate = execute_hook("subagent-gate", None, Some("antigravity"), &payload).unwrap();
+        assert_eq!(third_gate.code, 0);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&third_gate.stdout).unwrap(),
+            json!({ "decision": "allow" })
+        );
+        // Clean up the writer lock released by subagent-dispatch.
+        let _ = execute_hook("subagent-dispatch", None, Some("antigravity"), &post_payload).unwrap();
     }
 }
